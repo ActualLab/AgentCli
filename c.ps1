@@ -29,6 +29,139 @@ function ConvertTo-DockerPath {
     return $WindowsPath -replace "\\", "/"
 }
 
+# Returns true if $Path is the same as $Root or sits underneath it.
+# Case-insensitive (Windows) and tolerant of trailing slashes.
+function Test-IsUnderRoot {
+    param([Parameter(Mandatory)][string]$Path, [string]$Root)
+    if (-not $Root) { return $false }
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+    $pathFull = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    if ($pathFull -eq $rootFull) { return $true }
+    $cmp = [System.StringComparison]::OrdinalIgnoreCase
+    return $pathFull.StartsWith("$rootFull\", $cmp) -or $pathFull.StartsWith("$rootFull/", $cmp)
+}
+
+# Collapse an absolute host path into a single-segment folder name that can be
+# used as a /proj/<name> mount target inside Docker. Drive-letter colons and
+# path separators all become single underscores.
+#   C:\Users\Alex\foo  ->  C_Users_Alex_foo
+#   /home/user/proj    ->  home_user_proj
+function ConvertTo-SanitizedProjectName {
+    param([Parameter(Mandatory)][string]$Path)
+    $name = $Path -replace '[\\/:]+', '_'
+    $name = $name -replace '_+', '_'
+    return $name.Trim('_')
+}
+
+# Create or refresh a directory link: Junction on Windows (no admin needed),
+# symlink elsewhere. Idempotent — if a matching link already exists, leaves it.
+# If $Target exists as a real directory (not a link), the call is a no-op with
+# a warning so we never clobber user content.
+function Set-AgentCliLink {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Target
+    )
+
+    if (-not (Test-Path $Source)) {
+        Write-Host "  Source not found, skipping: $Source" -ForegroundColor DarkGray
+        return
+    }
+
+    $parent = Split-Path -Parent $Target
+    if (-not (Test-Path $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    if (Test-Path $Target) {
+        $item = Get-Item $Target -Force
+        if ($item.LinkType -in 'Junction', 'SymbolicLink') {
+            # Safe non-recursive delete that doesn't follow the link.
+            [System.IO.Directory]::Delete($Target, $false)
+        } else {
+            Write-Host "  $Target exists as a regular directory; leaving it alone. Move/remove it manually if you want the AgentCli link." -ForegroundColor Yellow
+            return
+        }
+    }
+
+    $isWin = $IsWindows -or $env:OS -eq "Windows_NT"
+    if ($isWin) {
+        $null = New-Item -ItemType Junction -Path $Target -Value $Source -ErrorAction Stop
+    } else {
+        & ln -s $Source $Target
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "ln -s failed: $Target -> $Source"
+            return
+        }
+    }
+    Write-Host "  Linked $Target -> $Source" -ForegroundColor Green
+}
+
+# Boot-session marker — a tiny file stamped with the current OS boot time.
+# Used by the compose auto-start to avoid running `docker compose up -d`
+# more than once per OS reboot (it's a no-op when nothing changed, but still
+# costs ~1s of overhead per launch).
+$script:ComposeMarkerPath = Join-Path ([System.IO.Path]::GetTempPath()) "agentcli-compose-started.txt"
+
+function Get-OsBootStamp {
+    $os = Get-CurrentOS
+    try {
+        switch ($os) {
+            "Windows" {
+                $bt = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+                return $bt.ToUniversalTime().ToString("o")
+            }
+            "macOS" {
+                $raw = & sysctl -n kern.boottime 2>$null
+                if ($raw -match 'sec\s*=\s*(\d+)') { return "macos-$($Matches[1])" }
+            }
+            default {
+                # Linux / Docker / WSL: btime line in /proc/stat is the boot epoch.
+                $line = Select-String -Path /proc/stat -Pattern '^btime\s+(\d+)$' -ErrorAction Stop | Select-Object -First 1
+                if ($line) { return "linux-$($line.Matches[0].Groups[1].Value)" }
+            }
+        }
+    } catch {}
+    return $null
+}
+
+function Test-ComposeStartedThisBoot {
+    if (-not (Test-Path $script:ComposeMarkerPath)) { return $false }
+    $stored  = (Get-Content $script:ComposeMarkerPath -Raw -ErrorAction SilentlyContinue).Trim()
+    $current = Get-OsBootStamp
+    return ($stored -and $current -and $stored -eq $current)
+}
+
+function Set-ComposeStartedThisBoot {
+    $current = Get-OsBootStamp
+    if ($current) {
+        Set-Content -Path $script:ComposeMarkerPath -Value $current -NoNewline
+    }
+}
+
+# Starts the AgentCli docker-compose stack. Idempotent (`up -d` is a no-op when
+# everything is already running). Writes the boot-session marker on success.
+function Invoke-ComposeStart {
+    $composeFile = Join-Path $scriptDir "docker-compose.yml"
+    if (-not (Test-Path $composeFile)) {
+        Write-Host "No docker-compose.yml at $composeFile — skipping compose-start." -ForegroundColor DarkGray
+        return
+    }
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        Write-Host "docker not found in PATH — skipping compose-start." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "Starting AgentCli docker-compose stack..." -ForegroundColor Cyan
+    & docker compose -f $composeFile up -d
+    if ($LASTEXITCODE -eq 0) {
+        Set-ComposeStartedThisBoot
+        Write-Host "Compose stack ready." -ForegroundColor Green
+    } else {
+        Write-Host "docker compose up exited with code $LASTEXITCODE — leaving boot marker unset so it retries next launch." -ForegroundColor Yellow
+    }
+}
+
 # Check if Windows Terminal is available
 function Test-WindowsTerminal {
     if ($IsWindows -or $env:OS -eq "Windows_NT") {
@@ -67,13 +200,14 @@ $hasEdge   = ($args | Where-Object { $_ -match $EdgeArgPattern   }).Count -gt 0
 if ($currentOS -eq "Windows" -and $hasWindowsTerminal -and -not $env:WT_SESSION -and -not $hasChrome -and -not $hasEdge) {
     $scriptPath = $MyInvocation.MyCommand.Path
     $workDir = (Get-Location).Path
-    # Keep terminal open for build, install, dry-run, debug, or help (only auto-close when actually running Claude)
+    # Keep terminal open for build, install, compose-start, dry-run, debug, or help (only auto-close when actually running Claude)
     $hasDebug = $args -contains "--debug"
     $hasBuild = $args -contains "build"
     $hasInstall = $args -contains "install"
+    $hasComposeStart = $args -contains "compose-start"
     $hasDryRun = $args -contains "--dry-run"
     $hasHelp = $args -contains "help" -or $args -contains "-h" -or $args -contains "--help" -or $args -contains "-?"
-    if ($hasDebug -or $hasBuild -or $hasInstall -or $hasDryRun -or $hasHelp) {
+    if ($hasDebug -or $hasBuild -or $hasInstall -or $hasComposeStart -or $hasDryRun -or $hasHelp) {
         $wtArgs = @("-d", $workDir, "--", "pwsh", "-NoProfile", "-NoExit", "-File", $scriptPath) + $args
     } else {
         $wtArgs = @("-d", $workDir, "--", "pwsh", "-NoProfile", "-File", $scriptPath) + $args
@@ -157,6 +291,8 @@ function Invoke-PostWorktreeHook {
 }
 
 # Find project root via git. Detects worktrees automatically.
+# Falls back to cwd (with no worktree info) when the current directory is not
+# inside a git repository — necessary so the launcher can run from any folder.
 function Find-ProjectRoot {
     param([switch]$Debug)
 
@@ -166,8 +302,15 @@ function Find-ProjectRoot {
     # Find git repo root
     $gitRoot = git rev-parse --show-toplevel 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $gitRoot) {
-        if ($Debug) { Write-Host "[DEBUG] Not in a git repository" }
-        return $null
+        if ($Debug) { Write-Host "[DEBUG] Not in a git repository — using cwd as project root" }
+        $folderName = Split-Path -Leaf $currentPath
+        return @{
+            ProjectName  = $folderName
+            FolderName   = $folderName
+            ProjectRoot  = $currentPath
+            RelativePath = ""
+            Worktree     = ""
+        }
     }
 
     # Normalize: git returns forward slashes; convert to platform separator
@@ -218,6 +361,7 @@ function Find-ProjectRoot {
 
 # Main logic
 $currentOS             = Get-CurrentOS
+$cli                   = "claude" # default CLI (claude | codex | grok)
 $mode                  = "docker"  # default mode
 $fromMode              = $null     # set when self-invoked (e.g., from-docker, from-wsl)
 $worktreeSuffix        = $null     # set when wt argument is used
@@ -227,26 +371,52 @@ $wtType                = $null     # worktree type: "feature" or "bugfix"
 $newContainer          = $false
 $dryRun                = $false
 $debugMode             = $false
-$claudeArgs            = @()
+$cliSet                = $false  # true once an explicit CLI has been consumed from args
+$cliArgs               = @()
+
+# CLI registry — each supported CLI maps to its executable name and the args
+# used in "yolo" mode (i.e. inside the sandboxed Docker container). On the
+# host OS we never add these flags, so each CLI runs interactively with its
+# usual approval prompts.
+$CliConfig = @{
+    "claude" = @{
+        Command       = "claude"
+        SandboxedArgs = @("--dangerously-skip-permissions")
+    }
+    "codex" = @{
+        Command       = "codex"
+        SandboxedArgs = @("--full-auto")
+    }
+    "grok" = @{
+        Command       = "grok"
+        SandboxedArgs = @()
+    }
+}
 
 # Show help
 function Show-Help {
-    Write-Host "Claude Launcher - Run Claude in Docker, WSL, or native OS" -ForegroundColor Cyan
+    Write-Host "AgentCli Launcher - Run Claude / Codex / Grok in Docker, WSL, or native OS" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "Usage: c [command] [options] [claude-args]" -ForegroundColor Yellow
+    Write-Host "Usage: c [cli] [command] [options] [cli-args]" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "CLIs (first positional arg, default: claude):"
+    Write-Host "  claude       Anthropic Claude Code (default)"
+    Write-Host "  codex        OpenAI Codex"
+    Write-Host "  grok         xAI Grok"
     Write-Host ""
     Write-Host "Commands:"
-    Write-Host "  (default)    Run Claude in Docker container"
-    Write-Host "  os           Run Claude directly on host OS"
-    Write-Host "  wsl          Run Claude in WSL (Windows only)"
+    Write-Host "  (default)    Run selected CLI in Docker container"
+    Write-Host "  os           Run selected CLI directly on host OS"
+    Write-Host "  wsl          Run selected CLI in WSL (Windows only)"
     Write-Host "  wt <suffix>  Create/use worktree from current branch (e.g., wt experiment)"
     Write-Host "  fwt <suffix> Create/use feature worktree with feat/<suffix> branch (e.g., fwt feature1)"
     Write-Host "  bwt <suffix> Create/use bugfix worktree with bugfix/<suffix> branch (e.g., bwt issue123)"
     Write-Host "  rwt <suffix> Remove worktree and clean up (ports, hosts, nginx config)"
     Write-Host "  chrome       Start Chrome with remote debugging enabled (for Playwright)"
-    Write-Host "  build        Build Docker image for current project"
+    Write-Host "  build        Build the shared AgentCli Docker image (claude-<agentcli folder>)"
     Write-Host "  install      Register 'c' globally (user PATH on Windows, shell alias on Unix) and build Docker image"
-    Write-Host "  update-md    Regenerate CLAUDE.md/AGENTS.md from .claude/CLAUDE-N-*.md parts"
+    Write-Host "  compose-start Start the AgentCli docker-compose stack (chrome-devtools-mcp, etc.) — auto-runs once per OS boot"
+    Write-Host "  update-md    Regenerate AGENTS.md/CLAUDE.md in cwd from AGENTS-Source.md (cwd) + AGENTS-Suffix.md (AgentCli)"
     Write-Host "  help         Show this help message"
     Write-Host ""
     Write-Host "Options:"
@@ -259,7 +429,7 @@ function Show-Help {
     Write-Host "  AC_CLAUDE_ISOLATE Set to 'true' or '1' to isolate .claude.json per container instance"
     Write-Host "  AC_POST_WORKTREE_HOOK  Script run after fwt/bwt creates a worktree; receives the worktree path"
     Write-Host ""
-    Write-Host "Environment variables set for Claude:"
+    Write-Host "Environment variables set for the launched CLI:"
     Write-Host "  AC_ProjectRoot      Project root path (/proj in Docker)"
     Write-Host "  AC_ProjectPath      Full path to current project (or worktree)"
     Write-Host "  AC_OS               OS/environment description"
@@ -277,10 +447,15 @@ function Show-Help {
     Write-Host "  Base branch for fwt/bwt: 'dev' if it exists on origin, otherwise 'master'"
     Write-Host ""
     Write-Host "Examples:"
-    Write-Host "  c                  Run Claude in Docker"
+    Write-Host "  c                  Run Claude in Docker (claude is the default CLI)"
+    Write-Host "  c claude           Same as 'c' - explicit Claude in Docker"
+    Write-Host "  c codex            Run Codex in Docker"
+    Write-Host "  c grok             Run Grok in Docker"
     Write-Host "  c --dry-run        Show what Docker would run"
-    Write-Host "  c os               Run Claude on host OS"
-    Write-Host "  c wsl              Run Claude in WSL"
+    Write-Host "  c os               Run Claude on host OS (default CLI)"
+    Write-Host "  c codex os         Run Codex on host OS"
+    Write-Host "  c grok wsl         Run Grok in WSL"
+    Write-Host "  c claude wsl       Run Claude in WSL (explicit)"
     Write-Host "  c wt experiment    Run in worktree from current branch"
     Write-Host "  c fwt feature1     Run in worktree with feat/feature1 branch"
     Write-Host "  c bwt issue123     Run in worktree with bugfix/issue123 branch"
@@ -301,20 +476,30 @@ function Show-Help {
     Write-Host "  c audio            Setup/start PulseAudio for voice mode (macOS only)"
     Write-Host "  c build            Build Docker image"
     Write-Host "  c install          Register 'c' globally and build the Docker image (run once after cloning AgentCli)"
-    Write-Host "  c --resume abc     Pass --resume abc to Claude"
+    Write-Host "  c --resume abc     Pass --resume abc to the selected CLI"
     Write-Host ""
 }
 
 # Parse arguments
-# All c.ps1 commands must come first, then all remaining args go to Claude
+# All c.ps1 commands must come first, then all remaining args go to the selected CLI
 $argIndex = 0
 
-# Parse c.ps1 commands (mode, wt, from-*, --dry-run) - must come before Claude args
+# Parse c.ps1 commands (cli, mode, wt, from-*, --dry-run) - must come before CLI args
 while ($argIndex -lt $args.Count) {
     $currentArg = $args[$argIndex]
 
+    # CLI selector — accepted anywhere before a mode is committed and only once.
+    # Typical placement is the very first positional arg (`c codex`, `c grok os`),
+    # but `c --dry-run codex` also works because flags are parsed in the same loop.
+    if ($currentArg -in "claude", "codex", "grok" -and -not $cliSet -and $mode -eq "docker") {
+        $cli = $currentArg
+        $cliSet = $true
+        $argIndex++
+        continue
+    }
+
     # Check for mode commands
-    if ($currentArg -in "wsl", "os", "build", "audio", "update-md", "install" -and $mode -eq "docker") {
+    if ($currentArg -in "wsl", "os", "build", "audio", "update-md", "install", "compose-start" -and $mode -eq "docker") {
         $mode = $currentArg
         $argIndex++
         continue
@@ -445,14 +630,19 @@ while ($argIndex -lt $args.Count) {
         continue
     }
 
-    # Not a c.ps1 command - stop parsing, rest goes to Claude
+    # Not a c.ps1 command - stop parsing, rest goes to the selected CLI
     break
 }
 
-# All remaining args go to Claude
+# All remaining args go to the selected CLI (claude/codex/grok)
 if ($argIndex -lt $args.Count) {
-    $claudeArgs = $args[$argIndex..($args.Count - 1)]
+    $cliArgs = $args[$argIndex..($args.Count - 1)]
 }
+
+# Resolve the CLI configuration once, so the os/wsl/docker handlers below can
+# stay agnostic of which CLI was picked.
+$cliCommand       = $CliConfig[$cli].Command
+$cliSandboxedArgs = $CliConfig[$cli].SandboxedArgs
 
 # Handle install: register c.ps1 globally (user PATH on Windows, shell alias on Unix)
 # and build the Docker image for AgentCli. Runs before project-root detection so it
@@ -517,6 +707,22 @@ if ($mode -eq "install") {
         Write-Host "(Run 'source $rcFile' or open a new shell for the alias to take effect.)" -ForegroundColor DarkGray
     }
 
+    # Link AgentCli's .claude/{commands,skills} into the user's global Claude
+    # config under an `agent-cli` subfolder so every Claude session (Docker, WSL,
+    # or host) sees them as shared. Skipped when running inside Docker (the
+    # Docker handler bind-mounts these subfolders at launch instead).
+    if ($installOS -ne "Docker") {
+        Write-Host ""
+        Write-Host "Linking AgentCli .claude/commands and .claude/skills..." -ForegroundColor Cyan
+        $homeForLinks  = if ($installOS -eq "Windows") { $env:USERPROFILE } else { $env:HOME }
+        $globalClaude  = Join-Path $homeForLinks ".claude"
+        foreach ($folder in @("commands", "skills")) {
+            $src = Join-Path $scriptDir ".claude" $folder
+            $dst = Join-Path $globalClaude $folder "agent-cli"
+            Set-AgentCliLink -Source $src -Target $dst
+        }
+    }
+
     # Build the Docker image for AgentCli itself. Uses $scriptDir (not the current
     # directory) so install works from anywhere.
     Write-Host ""
@@ -545,46 +751,45 @@ if ($mode -eq "install") {
     exit 0
 }
 
-# Handle update-md: regenerate CLAUDE.md and AGENTS.md from .claude/CLAUDE-N-*.md parts.
-# Runs before project-root detection so it has no side effects (no port allocation, no .env writes).
+# Handle update-md: regenerate byte-identical AGENTS.md and CLAUDE.md by
+# concatenating two sources:
+#   1. AGENTS-Source.md from the project where c.ps1 was launched ((Get-Location).Path) —
+#      optional, holds the project-specific local part.
+#   2. AGENTS-Suffix.md from the AgentCli repo ($scriptDir) — required, the shared
+#      boilerplate appended to every project's generated docs.
+# Output AGENTS.md and CLAUDE.md are written to the launch folder. Runs before
+# project-root detection so it has no side effects and works outside a git repo.
 if ($mode -eq "update-md") {
-    $claudeDir = Join-Path $scriptDir ".claude"
-    if (-not (Test-Path $claudeDir)) {
-        Write-Error ".claude directory not found at: $claudeDir"
+    $launchDir = (Get-Location).Path
+    $suffixPath = Join-Path $scriptDir "AGENTS-Suffix.md"
+    $sourcePath = Join-Path $launchDir "AGENTS-Source.md"
+
+    if (-not (Test-Path $suffixPath)) {
+        Write-Error "AGENTS-Suffix.md not found in AgentCli folder at: $suffixPath"
         exit 1
     }
 
-    $parts = Get-ChildItem -Path $claudeDir -Filter "CLAUDE-*.md" |
-        Where-Object { $_.Name -match '^CLAUDE-(\d+)-.+\.md$' } |
-        Sort-Object { [int]([regex]::Match($_.Name, '^CLAUDE-(\d+)-').Groups[1].Value) }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $partNames = [System.Collections.Generic.List[string]]::new()
 
-    if (-not $parts -or $parts.Count -eq 0) {
-        Write-Error "No CLAUDE-N-*.md files found in $claudeDir"
-        exit 1
+    if (Test-Path $sourcePath) {
+        $parts.Add((Get-Content -Raw -Path $sourcePath).TrimEnd())
+        $partNames.Add("AGENTS-Source.md (this folder)")
+    } else {
+        Write-Host "Note: no AGENTS-Source.md in $launchDir — emitting suffix only." -ForegroundColor Yellow
     }
+    $parts.Add((Get-Content -Raw -Path $suffixPath).TrimEnd())
+    $partNames.Add("AGENTS-Suffix.md (AgentCli)")
 
-    function Write-Concatenated {
-        param([string]$Path, [object[]]$Files)
-        $names = @($Files | ForEach-Object { $_.Name })
-        $sourceList = switch ($names.Count) {
-            1 { ".claude/$($names[0])" }
-            2 { ".claude/$($names[0]) and .claude/$($names[1])" }
-            default {
-                $prefixed = $names | ForEach-Object { ".claude/$_" }
-                $head = $prefixed[0..($prefixed.Count - 2)] -join ', '
-                "$head, and $($prefixed[-1])"
-            }
-        }
-        $header = "!!! This file is generated by concatenating $sourceList. If you have to update it, update the corresponding source file(s) as well."
-        $bodies = $Files | ForEach-Object { (Get-Content -Raw -Path $_.FullName).TrimEnd() }
-        $content = $header + "`n`n" + (($bodies -join "`n`n")) + "`n"
-        Set-Content -Path $Path -Value $content -NoNewline -Encoding utf8NoBOM
-        Write-Host "Wrote $Path ($($Files.Count) parts: $($names -join ', '))"
+    $sourceDesc = $partNames -join " + "
+    $header = "<!-- AUTO-GENERATED — DO NOT EDIT. Built by ``c update-md`` from $sourceDesc. To change anything below, edit the source file(s) and re-run ``c update-md``. -->"
+    $content = $header + "`n`n" + (($parts -join "`n`n")) + "`n"
+
+    foreach ($outName in @("AGENTS.md", "CLAUDE.md")) {
+        $outPath = Join-Path $launchDir $outName
+        Set-Content -Path $outPath -Value $content -NoNewline -Encoding utf8NoBOM
+        Write-Host "Wrote $outPath ($sourceDesc)"
     }
-
-    Write-Concatenated -Path (Join-Path $scriptDir "CLAUDE.md") -Files $parts
-    $agentsParts = $parts | Where-Object { $_.Name -notlike '*Launcher.md' }
-    Write-Concatenated -Path (Join-Path $scriptDir "AGENTS.md") -Files $agentsParts
     exit 0
 }
 
@@ -623,8 +828,22 @@ if ($fromMode -and $env:AC_ProjectPath) {
     $worktree     = $projectInfo.Worktree
 }
 
-# Save the original folder name (where c.ps1 was invoked from, before wt/fwt/bwt)
-$originalFolderName = $folderName
+# Out-of-tree detection: true when the resolved project root is NOT under
+# AC_ProjectRoot (i.e. some folder outside the standard /Projects tree).
+# Only the Docker handler cares — it sanitizes the path into a /proj/<name>
+# mount target. OS / WSL modes just use the actual project path verbatim.
+$isOutOfTree = -not (Test-IsUnderRoot $projectRoot $env:AC_ProjectRoot)
+if ($debugMode -and $isOutOfTree) {
+    Write-Host "[DEBUG] Project is out-of-tree: $projectRoot is not under $env:AC_ProjectRoot"
+}
+
+# AgentCli's own folder name (leaf of $scriptDir). Used to locate this script
+# inside Docker (/proj/<name>/c.ps1) and to derive the shared image name.
+$agentCliFolderName = Split-Path -Leaf $scriptDir
+if (-not (Test-IsUnderRoot $scriptDir $env:AC_ProjectRoot)) {
+    Write-Error "AgentCli ($scriptDir) is not under AC_ProjectRoot ($env:AC_ProjectRoot). Set AC_ProjectRoot to a folder that contains AgentCli, or leave it unset to default to AgentCli's parent."
+    exit 1
+}
 
 # Port registry for worktree server ports
 class PortRegistry {
@@ -1356,7 +1575,7 @@ function Show-DryRun {
     Write-Host ""
     Write-Host "=== DRY RUN ($ModeName) ===" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "Environment variables for Claude:" -ForegroundColor Cyan
+    Write-Host "Environment variables:" -ForegroundColor Cyan
     foreach ($key in $EnvVars.Keys | Sort-Object) {
         Write-Host "  $key=$($EnvVars[$key])"
     }
@@ -1609,18 +1828,39 @@ function Start-DebugBrowsers {
     }
 }
 
+# Auto-start the docker-compose stack once per OS boot session. Triggered only
+# for the CLI-launch modes (docker/os/wsl); skipped for admin commands (build,
+# audio, chrome, edge, compose-start handles itself), dry runs, and the inner
+# `from-docker` / `from-wsl` self-invocation (which the outer instance already
+# covered).
+if ($mode -in 'docker', 'os', 'wsl' -and -not $fromMode -and -not $dryRun) {
+    if (-not (Test-ComposeStartedThisBoot)) {
+        Write-Host "Compose stack not yet started this boot — starting it now..." -ForegroundColor DarkGray
+        Invoke-ComposeStart
+    }
+}
+
 switch ($mode) {
+    "compose-start" {
+        Invoke-ComposeStart
+    }
+
     "build" {
-        # Build Docker image
-        $imageName = "claude-$($projectName.ToLower())"
+        # Build the shared AgentCli Docker image (used by every project).
+        $imageName     = "claude-$($agentCliFolderName.ToLower())"
+        $dockerfilePath = Join-Path $scriptDir "claude.Dockerfile"
         Write-Host "Building Docker image: $imageName"
+        Write-Host "  Dockerfile: $dockerfilePath"
         if (-not $dryRun) {
             # Capture containers based on the current image BEFORE rebuilding.
             # After rebuild the tag points to a new image ID, and containers based
             # on the old (now-dangling) image would no longer match an ancestor filter.
+            # Note: the AgentCli image is shared across all projects, so this nukes
+            # every running container that's still on the old image, regardless of
+            # which project they belong to. That's intentional — they'd be stale.
             $staleContainers = @(docker ps -a --filter "ancestor=$imageName" --format "{{.ID}}`t{{.Names}}" 2>$null | Where-Object { $_ })
 
-            docker build -t $imageName -f "$projectRoot/claude.Dockerfile" $projectRoot
+            docker build -t $imageName -f $dockerfilePath $scriptDir
             if ($LASTEXITCODE -eq 0 -and $staleContainers.Count -gt 0) {
                 Write-Host ""
                 Write-Host "Removing $($staleContainers.Count) container(s) based on the previous image:" -ForegroundColor Cyan
@@ -1637,7 +1877,7 @@ switch ($mode) {
             Write-Host "=== DRY RUN ===" -ForegroundColor Yellow
             Write-Host ""
             Write-Host "Command:" -ForegroundColor Cyan
-            Write-Host "  docker build -t $imageName -f `"$projectRoot/claude.Dockerfile`" $projectRoot"
+            Write-Host "  docker build -t $imageName -f `"$dockerfilePath`" $scriptDir"
             Write-Host ""
         }
     }
@@ -1651,16 +1891,17 @@ switch ($mode) {
         # Convert paths for WSL
         $wslProjectRoot = ConvertTo-WSLPath $env:AC_ProjectRoot
         $wslWorkDir = "/mnt/" + ((Get-Location).ToString().Substring(0, 1).ToLower()) + ((Get-Location).ToString().Substring(2) -replace "\\", "/")
-        # Use c.ps1 from where it was originally invoked (could be main project or a worktree)
-        $wslScriptPath = "$wslProjectRoot/$originalFolderName/c.ps1"
+        # Always re-invoke AgentCli's c.ps1 (consumer projects no longer carry a copy).
+        $wslScriptPath = (ConvertTo-WSLPath $scriptDir) + "/c.ps1"
 
         Write-Host "Working Directory: $wslWorkDir @ $wslProjectRoot"
 
-        # Build args for the script running in WSL
-        $wslArgs = @("os", "from-wsl")
+        # Build args for the script running in WSL. The CLI selector is prepended so
+        # the inner pwsh c.ps1 invocation parses it back into $cli.
+        $wslArgs = @($cli, "os", "from-wsl")
         if ($dryRun) { $wslArgs += "--dry-run" }
         if ($debugMode) { $wslArgs += "--debug" }
-        $wslArgs += $claudeArgs
+        $wslArgs += $cliArgs
 
         # Collect propagated env vars for WSL (same rules as Docker)
         $wslPropagatedParts = @()
@@ -1698,13 +1939,13 @@ switch ($mode) {
             Write-Host ""
             Write-Host "=== DRY RUN (WSL) ===" -ForegroundColor Yellow
             Write-Host ""
-            Write-Host "Environment variables for Claude:" -ForegroundColor Cyan
+            Write-Host "Environment variables:" -ForegroundColor Cyan
             foreach ($key in $wslEnvVars.Keys | Sort-Object) {
                 Write-Host "  $key=$($wslEnvVars[$key])"
             }
             Write-Host ""
             Write-Host "Command:" -ForegroundColor Cyan
-            $cmdLine = ("claude " + ($claudeArgs -join ' ')).Trim()
+            $cmdLine = ("$cliCommand " + ($cliArgs -join ' ')).Trim()
             Write-Host "  $cmdLine"
             Write-Host ""
             Write-Host "WSL launch command:" -ForegroundColor Cyan
@@ -1716,7 +1957,7 @@ switch ($mode) {
     }
 
     "os" {
-        # Run Claude directly on the host OS
+        # Run the selected CLI directly on the host OS
         $env:AC_ProjectPath = $projectRoot
         $env:AC_Worktree    = $worktree
         $env:DISABLE_AUTOUPDATER = "1"
@@ -1728,7 +1969,7 @@ switch ($mode) {
             default  { $currentOS }
         }
 
-        Write-Host "Running Claude on: $($env:AC_OS)"
+        Write-Host "Running $cli on: $($env:AC_OS)"
         Write-Host "Working Directory: $(Get-Location) @ $env:AC_ProjectRoot"
         if ($worktree) {
             $worktreeInfo = "Worktree: $worktree"
@@ -1743,20 +1984,20 @@ switch ($mode) {
             "AC_Worktree"       = $env:AC_Worktree
         }
 
-        if ($currentOS -eq "Windows") {
+        if ($currentOS -eq "Windows" -and $cli -eq "claude") {
             $env:CLAUDE_CODE_USE_POWERSHELL_TOOL = "1"
             $envVars["CLAUDE_CODE_USE_POWERSHELL_TOOL"] = "1"
         }
 
         if ($dryRun) {
             $allArgs = if ($currentOS -eq "Docker") {
-                @("--dangerously-skip-permissions") + $claudeArgs
+                @($cliSandboxedArgs) + $cliArgs
             } else {
-                $claudeArgs
+                $cliArgs
             }
-            Show-DryRun -EnvVars $envVars -Command "claude" -Arguments $allArgs -ModeName $env:AC_OS
+            Show-DryRun -EnvVars $envVars -Command $cliCommand -Arguments $allArgs -ModeName $env:AC_OS
         } else {
-            # Only skip permissions in Docker (sandboxed environment)
+            # Only apply CLI's "yolo" args in Docker (sandboxed environment)
             if ($currentOS -eq "Docker") {
                 # Copy host SSH keys to ~/.ssh with strict perms (host bind-mount has loose
                 # Windows perms that OpenSSH rejects). Skip silently if no host mount.
@@ -1767,18 +2008,19 @@ switch ($mode) {
                     & chmod 700 $sshDir
                     & sh -c "chmod 600 $sshDir/* 2>/dev/null; chmod 644 $sshDir/*.pub $sshDir/known_hosts $sshDir/config 2>/dev/null; true"
                 }
-                & claude --dangerously-skip-permissions @claudeArgs
+                $allArgs = @($cliSandboxedArgs) + $cliArgs
+                & $cliCommand @allArgs
                 if ($debugMode) {
                     Write-Host ""
                     Read-Host "Press Enter to close..."
                 }
             } elseif ($currentOS -eq "WSL") {
-                # In WSL, use bash -i to run claude (interactive shell sources .bashrc with npm PATH)
-                $claudeCmd = ("claude " + ($claudeArgs -join ' ')).Trim()
-                & bash -i -c $claudeCmd
+                # In WSL, use bash -i so the interactive shell sources .bashrc and picks up the npm PATH
+                $cmdLine = ("$cliCommand " + ($cliArgs -join ' ')).Trim()
+                & bash -i -c $cmdLine
             } else {
                 # Windows/Linux/macOS - already in wt on Windows (handled at script start)
-                & claude @claudeArgs
+                & $cliCommand @cliArgs
             }
         }
     }
@@ -1804,22 +2046,50 @@ switch ($mode) {
         # Mount entire AC_ProjectRoot as /proj/ — all sibling projects are visible
         $volumeMounts += New-VolumeMount $env:AC_ProjectRoot "/proj"
 
-        # Artifact/node_modules overrides for current project only (avoids permission conflicts with host)
-        $currentFolderName  = if ($worktree) { "$projectName-$worktree" } else { $projectName }
-        $currentHostPath    = Join-Path $env:AC_ProjectRoot $currentFolderName
-        $artifactsHostPath  = Join-Path $currentHostPath "artifacts" "claude-docker"
-        $volumeMounts += New-VolumeMount $artifactsHostPath "/proj/$currentFolderName/artifacts" -EnsureExists
-
-        # node_modules from artifacts/claude-docker for persistence across container restarts
-        $nodeModulesHostPath  = Join-Path $artifactsHostPath "node_modules"
-        $nodeModulesMountPoint = Join-Path $currentHostPath "node_modules"
-        if (-not (Test-Path $nodeModulesMountPoint)) {
-            New-Item -ItemType Directory -Path $nodeModulesMountPoint -Force | Out-Null
+        # Resolve the project's folder name inside Docker.
+        #   In-tree:  /proj/<folderName>          (covered by the AC_ProjectRoot mount above)
+        #   Out-of-tree: /proj/<sanitized-path>   (needs its own mount, added below)
+        $currentFolderName = if ($isOutOfTree) {
+            ConvertTo-SanitizedProjectName $projectRoot
+        } elseif ($worktree) {
+            "$projectName-$worktree"
+        } else {
+            $projectName
         }
-        $volumeMounts += New-VolumeMount $nodeModulesHostPath "/proj/$currentFolderName/node_modules" -EnsureExists
+        $currentHostPath = $projectRoot
+
+        if ($isOutOfTree) {
+            $volumeMounts += New-VolumeMount $currentHostPath "/proj/$currentFolderName"
+        }
+
+        # Artifact/node_modules overrides for current project only (avoids permission
+        # conflicts with host). Skipped for out-of-tree projects so we don't litter
+        # random host folders (e.g. the user's home dir) with artifacts/ and node_modules/.
+        if (-not $isOutOfTree) {
+            $artifactsHostPath  = Join-Path $currentHostPath "artifacts" "claude-docker"
+            $volumeMounts += New-VolumeMount $artifactsHostPath "/proj/$currentFolderName/artifacts" -EnsureExists
+
+            # node_modules from artifacts/claude-docker for persistence across container restarts
+            $nodeModulesHostPath  = Join-Path $artifactsHostPath "node_modules"
+            $nodeModulesMountPoint = Join-Path $currentHostPath "node_modules"
+            if (-not (Test-Path $nodeModulesMountPoint)) {
+                New-Item -ItemType Directory -Path $nodeModulesMountPoint -Force | Out-Null
+            }
+            $volumeMounts += New-VolumeMount $nodeModulesHostPath "/proj/$currentFolderName/node_modules" -EnsureExists
+        }
 
         # Claude config mounts
         $volumeMounts += New-VolumeMount "$homeDir/.claude" "/home/claude/.claude"
+
+        # Mount AgentCli's .claude/{commands,skills} as `agent-cli` subfolders so
+        # AgentCli-shared slash commands and skills are visible inside the container.
+        # Mounted read-only — edit them on the host (in AgentCli) instead.
+        foreach ($folder in @("commands", "skills")) {
+            $hostPath = Join-Path $scriptDir ".claude" $folder
+            if (Test-Path $hostPath) {
+                $volumeMounts += New-VolumeMount $hostPath "/home/claude/.claude/$folder/agent-cli" -ReadOnly
+            }
+        }
 
         # Handle .claude.json mounting
         $claudeJsonPath = "$homeDir/.claude.json"
@@ -1877,22 +2147,32 @@ switch ($mode) {
 
         # Calculate Docker working directory
         $dockerWorkDir     = "/proj/$currentFolderName$relativePath"
-        $imageName         = "claude-$($projectName.ToLower())"
-        $containerBaseName = if ($worktree) { "$($projectName.ToLower())-$($worktree.ToLower())" } else { $projectName.ToLower() }
+        # All projects now share the AgentCli Docker image — no per-project Dockerfile.
+        $imageName         = "claude-$($agentCliFolderName.ToLower())"
+        # Container reuse / cleanup is still per-project (or per-worktree); for out-of-tree
+        # projects the sanitized folder name doubles as the container base name.
+        $containerBaseName = if ($isOutOfTree) {
+            $currentFolderName.ToLower()
+        } elseif ($worktree) {
+            "$($projectName.ToLower())-$($worktree.ToLower())"
+        } else {
+            $projectName.ToLower()
+        }
         $containerName     = "$containerBaseName-$(Get-Date -Format 'MMdd-HHmmss')"
-        # Use c.ps1 from where it was originally invoked (could be main project or a worktree)
-        $dockerScriptPath = "/proj/$originalFolderName/c.ps1"
+        # Always re-invoke AgentCli's c.ps1 (consumer projects no longer carry a copy).
+        $dockerScriptPath = "/proj/$agentCliFolderName/c.ps1"
 
         if ($dryRun) {
             Write-Host "Container: $containerName"
             Write-Host "Working Directory: $dockerWorkDir @ /proj"
         }
 
-        # Build args for the script running in Docker
-        $dockerScriptArgs = @("os", "from-docker")
+        # Build args for the script running in Docker. The CLI selector is prepended
+        # so the inner pwsh c.ps1 parses it back into $cli and runs the right binary.
+        $dockerScriptArgs = @($cli, "os", "from-docker")
         if ($dryRun) { $dockerScriptArgs += "--dry-run" }
         if ($debugMode) { $dockerScriptArgs += "--debug" }
-        $dockerScriptArgs += $claudeArgs
+        $dockerScriptArgs += $cliArgs
 
         # Container reuse logic (default unless --new is specified)
         if (-not $newContainer) {
@@ -2010,13 +2290,14 @@ switch ($mode) {
             Write-Host ""
             Write-Host "=== DRY RUN (Docker) ===" -ForegroundColor Yellow
             Write-Host ""
-            Write-Host "Environment variables for Claude:" -ForegroundColor Cyan
+            Write-Host "Environment variables:" -ForegroundColor Cyan
             foreach ($key in $dockerEnvVars.Keys | Sort-Object) {
                 Write-Host "  $key=$($dockerEnvVars[$key])"
             }
             Write-Host ""
             Write-Host "Command:" -ForegroundColor Cyan
-            Write-Host "  claude --dangerously-skip-permissions $($claudeArgs -join ' ')"
+            $dryCmd = ("$cliCommand " + (@($cliSandboxedArgs + $cliArgs) -join ' ')).Trim()
+            Write-Host "  $dryCmd"
             Write-Host ""
             Write-Host "Docker launch command:" -ForegroundColor Cyan
             Write-Host "  docker $($dockerArgs -join ' ')"

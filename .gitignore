@@ -39,6 +39,9 @@ ScaffoldingReadMe.txt
 # dotenv environment variables file
 .env
 
+# Scratch folder for temporary files, test scripts, screenshots, etc.
+tmp/
+
 # Others
 ~$*
 *~

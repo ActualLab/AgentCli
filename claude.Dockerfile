@@ -1,6 +1,6 @@
-# Claude Code sandbox environment for ActualLab projects
+# AgentCli sandbox environment for ActualLab projects
 # Supports: ActualLab.Fusion, ActualLab.Fusion.Samples, ActualChat
-# Includes: .NET 10 SDK, .NET 9 SDK, Node.js 20, Claude Code CLI
+# Includes: .NET 10 SDK, .NET 9 SDK, Node.js 20, Claude Code + Codex + Grok CLIs
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0.202
 
@@ -122,6 +122,13 @@ RUN playwright install chromium
 # Install Claude Code CLI (native installer, auto-update disabled at runtime)
 ENV DISABLE_AUTOUPDATER=1
 RUN curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.152
+
+# Install OpenAI Codex CLI (npm global, lands in /usr/local/share/npm-global/bin)
+RUN npm install -g @openai/codex
+
+# Install Grok CLI from x.ai. The installer writes to $HOME/.local/bin, which is
+# already first on PATH for this user (see the ENV PATH= line above).
+RUN curl -fsSL https://x.ai/cli/install.sh | bash
 
 # Default working directory (overridden by -w flag in docker run)
 WORKDIR /proj
