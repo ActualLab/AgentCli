@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "chrome-devtools-1": {
+      "type": "http",
+      "url": "http://localhost:8765/mcp"
+    },
+    "chrome-devtools-2": {
+      "type": "http",
+      "url": "http://localhost:8766/mcp"
+    },
+    "voxt-robokitty": {
+      "type": "http",
+      "url": "https://charter-reload-sarcastic.ngrok-free.dev/voxt-robokitty",
+      "headers": {
+        "ngrok-skip-browser-warning": "true"
+      }
+    }
+  }
+}
