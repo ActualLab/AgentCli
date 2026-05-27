@@ -290,72 +290,118 @@ function Invoke-PostWorktreeHook {
     }
 }
 
-# Find project root via git. Detects worktrees automatically.
-# Falls back to cwd (with no worktree info) when the current directory is not
-# inside a git repository — necessary so the launcher can run from any folder.
-function Find-ProjectRoot {
-    param([switch]$Debug)
-
-    $currentPath = (Get-Location).Path
-    if ($Debug) { Write-Host "[DEBUG] Starting Find-ProjectRoot, currentPath=$currentPath" }
-
-    # Find git repo root
-    $gitRoot = git rev-parse --show-toplevel 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $gitRoot) {
-        if ($Debug) { Write-Host "[DEBUG] Not in a git repository — using cwd as project root" }
-        $folderName = Split-Path -Leaf $currentPath
-        return @{
-            ProjectName  = $folderName
-            FolderName   = $folderName
-            ProjectRoot  = $currentPath
-            RelativePath = ""
-            Worktree     = ""
-        }
-    }
-
-    # Normalize: git returns forward slashes; convert to platform separator
-    $gitRootNorm = [System.IO.Path]::GetFullPath(($gitRoot -replace "/", [System.IO.Path]::DirectorySeparatorChar))
-
-    if ($Debug) {
-        Write-Host "[DEBUG] gitRoot=$gitRootNorm"
-    }
-
-    $folderName   = Split-Path -Leaf $gitRootNorm
-    $relativePath = ""
-    if ($currentPath.Length -gt $gitRootNorm.Length) {
-        $relativePath = $currentPath.Substring($gitRootNorm.Length) -replace "\\", "/"
-    }
-
-    if ($Debug) { Write-Host "[DEBUG] folderName=$folderName, relativePath=$relativePath" }
-
-    # Detect secondary git worktree: git-common-dir is absolute in worktrees, ".git" in main
-    $gitCommonDir = git rev-parse --git-common-dir 2>$null
-    $projectName  = $folderName
-    $worktree     = ""
-
+# Detects the worktree suffix (if any) for a given project root, by asking git.
+# Returns @{ ProjectName; Worktree } — both strings, worktree is "" for main.
+function Get-WorktreeInfo {
+    param([Parameter(Mandatory)][string]$ProjectRoot, [string]$FolderName)
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    $result = @{ ProjectName = $FolderName; Worktree = "" }
+    $gitCommonDir = & git -C $ProjectRoot rev-parse --git-common-dir 2>$null
     if ($LASTEXITCODE -eq 0 -and $gitCommonDir) {
-        $gitCommonDirNorm = $gitCommonDir -replace "/", [System.IO.Path]::DirectorySeparatorChar
-        $isAbsolute = [System.IO.Path]::IsPathRooted($gitCommonDirNorm)
-        if ($Debug) { Write-Host "[DEBUG] git-common-dir=$gitCommonDir, isAbsolute=$isAbsolute" }
-
-        if ($isAbsolute) {
-            # Secondary worktree: common dir is /path/to/main/.git
-            $mainProjectPath = Split-Path -Parent ($gitCommonDirNorm.TrimEnd('\', '/'))
+        $gitCommonDirNorm = $gitCommonDir -replace "/", $sep
+        if ([System.IO.Path]::IsPathRooted($gitCommonDirNorm)) {
+            $mainProjectPath = Split-Path -Parent ($gitCommonDirNorm.TrimEnd('\','/'))
             $mainProjectName = Split-Path -Leaf $mainProjectPath
-            if ($Debug) { Write-Host "[DEBUG] Worktree detected, mainProject=$mainProjectName" }
-            if ($folderName.StartsWith("$mainProjectName-")) {
-                $projectName = $mainProjectName
-                $worktree    = $folderName.Substring($mainProjectName.Length + 1)
+            if ($FolderName.StartsWith("$mainProjectName-")) {
+                $result.ProjectName = $mainProjectName
+                $result.Worktree    = $FolderName.Substring($mainProjectName.Length + 1)
             }
         }
     }
+    return $result
+}
 
+# Find the "effective project root" for the current cwd.
+#
+# Resolution rules:
+#   1. If cwd is exactly AC_ProjectRoot itself (the "Projects" folder), there
+#      is no specific project — return AtRoot=true. Docker handler uses /proj
+#      as the working dir and skips per-project mounts.
+#   2. If cwd is under AC_ProjectRoot, walk up to the *direct child* of
+#      AC_ProjectRoot. That's the project, regardless of where nested `.git`
+#      directories live. E.g. cwd=C:\Projects\ActualChat\bin → C:\Projects\ActualChat.
+#   3. Otherwise (cwd is outside AC_ProjectRoot — "out of tree"), use git's
+#      `--show-toplevel` if it's a repo, else fall back to cwd itself.
+function Find-ProjectRoot {
+    param([switch]$Debug)
+
+    $cwd      = (Get-Location).Path
+    $sep      = [System.IO.Path]::DirectorySeparatorChar
+    $cmp      = [System.StringComparison]::OrdinalIgnoreCase
+    $rootFull = [System.IO.Path]::GetFullPath($env:AC_ProjectRoot).TrimEnd('\','/')
+    $cwdFull  = [System.IO.Path]::GetFullPath($cwd).TrimEnd('\','/')
+    if ($Debug) { Write-Host "[DEBUG] Find-ProjectRoot cwd=$cwdFull, AC_ProjectRoot=$rootFull" }
+
+    # Rule 1 — at the Projects folder itself
+    if ($cwdFull -eq $rootFull) {
+        if ($Debug) { Write-Host "[DEBUG] cwd is exactly AC_ProjectRoot (AtRoot)" }
+        $leaf = Split-Path -Leaf $rootFull
+        return @{
+            ProjectName  = $leaf
+            FolderName   = $leaf
+            ProjectRoot  = $rootFull
+            RelativePath = ""
+            Worktree     = ""
+            AtRoot       = $true
+        }
+    }
+
+    # Rule 2 — under AC_ProjectRoot: walk up to the direct child
+    $isUnder = $cwdFull.StartsWith("$rootFull$sep", $cmp) -or $cwdFull.StartsWith("$rootFull/", $cmp)
+    if ($isUnder) {
+        $current = $cwdFull
+        while ($true) {
+            $parent = Split-Path -Parent $current
+            $parentFull = if ($parent) { [System.IO.Path]::GetFullPath($parent).TrimEnd('\','/') } else { $null }
+            if ($parentFull -eq $rootFull) { break }
+            if (-not $parent -or $parent -eq $current) { break }
+            $current = $parent
+        }
+        $projectRoot  = $current
+        $folderName   = Split-Path -Leaf $projectRoot
+        $relativePath = if ($cwdFull.Length -gt $projectRoot.Length) {
+            $cwdFull.Substring($projectRoot.Length) -replace "\\", "/"
+        } else { "" }
+        $wt = Get-WorktreeInfo -ProjectRoot $projectRoot -FolderName $folderName
+        if ($Debug) { Write-Host "[DEBUG] In-tree: projectRoot=$projectRoot, folder=$folderName, project=$($wt.ProjectName), worktree=$($wt.Worktree), rel=$relativePath" }
+        return @{
+            ProjectName  = $wt.ProjectName
+            FolderName   = $folderName
+            ProjectRoot  = $projectRoot
+            RelativePath = $relativePath
+            Worktree     = $wt.Worktree
+            AtRoot       = $false
+        }
+    }
+
+    # Rule 3 — out of tree: git's project root, or cwd if no git
+    if ($Debug) { Write-Host "[DEBUG] Out of tree, trying git" }
+    $gitRoot = git rev-parse --show-toplevel 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $gitRoot) {
+        if ($Debug) { Write-Host "[DEBUG] Not a git repo — using cwd" }
+        $leaf = Split-Path -Leaf $cwd
+        return @{
+            ProjectName  = $leaf
+            FolderName   = $leaf
+            ProjectRoot  = $cwd
+            RelativePath = ""
+            Worktree     = ""
+            AtRoot       = $false
+        }
+    }
+    $gitRootNorm = [System.IO.Path]::GetFullPath(($gitRoot -replace "/", $sep))
+    $folderName  = Split-Path -Leaf $gitRootNorm
+    $relativePath = if ($cwdFull.Length -gt $gitRootNorm.Length) {
+        $cwdFull.Substring($gitRootNorm.Length) -replace "\\", "/"
+    } else { "" }
+    $wt = Get-WorktreeInfo -ProjectRoot $gitRootNorm -FolderName $folderName
     return @{
-        ProjectName   = $projectName   # base project name (without worktree suffix)
-        FolderName    = $folderName    # actual folder name on disk
-        ProjectRoot   = $gitRootNorm   # full path to project/worktree folder
-        RelativePath  = $relativePath  # path from project root to cwd
-        Worktree      = $worktree      # worktree suffix, empty if main
+        ProjectName  = $wt.ProjectName
+        FolderName   = $folderName
+        ProjectRoot  = $gitRootNorm
+        RelativePath = $relativePath
+        Worktree     = $wt.Worktree
+        AtRoot       = $false
     }
 }
 
@@ -826,13 +872,16 @@ if ($fromMode -and $env:AC_ProjectPath) {
     $projectRoot  = $projectInfo.ProjectRoot
     $relativePath = $projectInfo.RelativePath -replace "\\", "/"
     $worktree     = $projectInfo.Worktree
+    $atRoot       = [bool]$projectInfo.AtRoot
 }
+if (-not (Get-Variable -Name atRoot -Scope Local -ErrorAction SilentlyContinue)) { $atRoot = $false }
 
 # Out-of-tree detection: true when the resolved project root is NOT under
 # AC_ProjectRoot (i.e. some folder outside the standard /Projects tree).
 # Only the Docker handler cares — it sanitizes the path into a /proj/<name>
 # mount target. OS / WSL modes just use the actual project path verbatim.
-$isOutOfTree = -not (Test-IsUnderRoot $projectRoot $env:AC_ProjectRoot)
+# AtRoot (cwd == AC_ProjectRoot) is in-tree by definition, never out-of-tree.
+$isOutOfTree = (-not $atRoot) -and (-not (Test-IsUnderRoot $projectRoot $env:AC_ProjectRoot))
 if ($debugMode -and $isOutOfTree) {
     Write-Host "[DEBUG] Project is out-of-tree: $projectRoot is not under $env:AC_ProjectRoot"
 }
@@ -2046,10 +2095,15 @@ switch ($mode) {
         # Mount entire AC_ProjectRoot as /proj/ — all sibling projects are visible
         $volumeMounts += New-VolumeMount $env:AC_ProjectRoot "/proj"
 
-        # Resolve the project's folder name inside Docker.
-        #   In-tree:  /proj/<folderName>          (covered by the AC_ProjectRoot mount above)
-        #   Out-of-tree: /proj/<sanitized-path>   (needs its own mount, added below)
-        $currentFolderName = if ($isOutOfTree) {
+        # Resolve the project's folder name + path inside the container.
+        #   AtRoot:       cwd == AC_ProjectRoot itself — no per-project mount,
+        #                 working dir is /proj (the AC_ProjectRoot mount above already
+        #                 covers it; mapping it to /proj/Projects would collide).
+        #   In-tree:      /proj/<folderName> — covered by the AC_ProjectRoot mount.
+        #   Out-of-tree:  /proj/<sanitized-path> — needs its own mount, added below.
+        $currentFolderName = if ($atRoot) {
+            Split-Path -Leaf $env:AC_ProjectRoot
+        } elseif ($isOutOfTree) {
             ConvertTo-SanitizedProjectName $projectRoot
         } elseif ($worktree) {
             "$projectName-$worktree"
@@ -2057,25 +2111,32 @@ switch ($mode) {
             $projectName
         }
         $currentHostPath = $projectRoot
+        $dockerProjectPath = if ($atRoot) { "/proj" } else { "/proj/$currentFolderName" }
 
         if ($isOutOfTree) {
-            $volumeMounts += New-VolumeMount $currentHostPath "/proj/$currentFolderName"
+            $volumeMounts += New-VolumeMount $currentHostPath $dockerProjectPath
         }
 
-        # Artifact/node_modules overrides for current project only (avoids permission
-        # conflicts with host). Skipped for out-of-tree projects so we don't litter
-        # random host folders (e.g. the user's home dir) with artifacts/ and node_modules/.
-        if (-not $isOutOfTree) {
-            $artifactsHostPath  = Join-Path $currentHostPath "artifacts" "claude-docker"
-            $volumeMounts += New-VolumeMount $artifactsHostPath "/proj/$currentFolderName/artifacts" -EnsureExists
-
-            # node_modules from artifacts/claude-docker for persistence across container restarts
-            $nodeModulesHostPath  = Join-Path $artifactsHostPath "node_modules"
-            $nodeModulesMountPoint = Join-Path $currentHostPath "node_modules"
-            if (-not (Test-Path $nodeModulesMountPoint)) {
-                New-Item -ItemType Directory -Path $nodeModulesMountPoint -Force | Out-Null
+        # Artifact/node_modules overrides per project (avoid permission conflicts
+        # with the host). Skipped when:
+        #   - AtRoot (no per-project mount target)
+        #   - Out-of-tree (don't litter random host folders with artifacts/node_modules/)
+        #   - The matching host folder doesn't already exist (don't auto-create them
+        #     in projects that don't use them).
+        if (-not $isOutOfTree -and -not $atRoot) {
+            $artifactsParent = Join-Path $currentHostPath "artifacts"
+            if (Test-Path $artifactsParent) {
+                $artifactsHostPath = Join-Path $artifactsParent "claude-docker"
+                $volumeMounts += New-VolumeMount $artifactsHostPath "$dockerProjectPath/artifacts" -EnsureExists
             }
-            $volumeMounts += New-VolumeMount $nodeModulesHostPath "/proj/$currentFolderName/node_modules" -EnsureExists
+
+            $nodeModulesMountPoint = Join-Path $currentHostPath "node_modules"
+            if (Test-Path $nodeModulesMountPoint) {
+                # Redirect node_modules into artifacts/claude-docker/node_modules so it
+                # persists across container rebuilds with consistent permissions.
+                $nodeModulesHostPath = Join-Path $currentHostPath "artifacts" "claude-docker" "node_modules"
+                $volumeMounts += New-VolumeMount $nodeModulesHostPath "$dockerProjectPath/node_modules" -EnsureExists
+            }
         }
 
         # Claude config mounts
@@ -2146,12 +2207,13 @@ switch ($mode) {
         }
 
         # Calculate Docker working directory
-        $dockerWorkDir     = "/proj/$currentFolderName$relativePath"
+        $dockerWorkDir     = "$dockerProjectPath$relativePath"
         # All projects now share the AgentCli Docker image — no per-project Dockerfile.
         $imageName         = "claude-$($agentCliFolderName.ToLower())"
         # Container reuse / cleanup is still per-project (or per-worktree); for out-of-tree
-        # projects the sanitized folder name doubles as the container base name.
-        $containerBaseName = if ($isOutOfTree) {
+        # projects the sanitized folder name doubles as the container base name; for the
+        # AtRoot case the AC_ProjectRoot leaf is the natural identifier.
+        $containerBaseName = if ($atRoot -or $isOutOfTree) {
             $currentFolderName.ToLower()
         } elseif ($worktree) {
             "$($projectName.ToLower())-$($worktree.ToLower())"
@@ -2210,8 +2272,8 @@ switch ($mode) {
             # No container selected - fall through to create new
         }
 
-        # Build project path env vars for Docker
-        $dockerProjectPath = "/proj/$currentFolderName"
+        # Build project path env vars for Docker. $dockerProjectPath was set up top
+        # ("/proj" for AtRoot, "/proj/<folder>" otherwise) and reused for $dockerWorkDir.
         $projectEnvVars = @(
             "-e", "AC_ProjectPath=$dockerProjectPath",
             "-e", "AC_Worktree=$worktree"
