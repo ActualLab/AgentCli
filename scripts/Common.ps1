@@ -301,6 +301,84 @@ function Update-HostEntries {
     return $IP
 }
 
+function Set-DirectoryLink {
+    <#
+    .SYNOPSIS
+        Creates or refreshes a cross-platform directory link.
+    .DESCRIPTION
+        Uses an NTFS junction on Windows (no admin needed) and a POSIX
+        symbolic link elsewhere. Idempotent — if $Target already exists
+        as a junction/symlink, it is replaced. If $Target exists as a
+        real (non-link) directory, the call is a no-op with a warning so
+        user content is never clobbered.
+    .PARAMETER Source
+        Directory the link should point at.
+    .PARAMETER Target
+        Path where the link itself is created.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Target
+    )
+
+    if (-not (Test-Path $Source)) {
+        Write-Host "  Source not found, skipping: $Source" -ForegroundColor DarkGray
+        return
+    }
+
+    $parent = Split-Path -Parent $Target
+    if ($parent -and -not (Test-Path $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    if (Test-Path $Target) {
+        $item = Get-Item $Target -Force
+        if ($item.LinkType -in 'Junction', 'SymbolicLink') {
+            [System.IO.Directory]::Delete($Target, $false)
+        } else {
+            Write-Host "  $Target exists as a regular directory; leaving it alone. Move/remove it manually if you want the link." -ForegroundColor Yellow
+            return
+        }
+    }
+
+    if ((Get-CurrentOS) -eq "Windows") {
+        $null = New-Item -ItemType Junction -Path $Target -Value $Source -ErrorAction Stop
+    } else {
+        & ln -s $Source $Target
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "ln -s failed: $Target -> $Source"
+            return
+        }
+    }
+    Write-Host "  Linked $Target -> $Source" -ForegroundColor Green
+}
+
+function Remove-DirectoryLink {
+    <#
+    .SYNOPSIS
+        Removes a directory link created by Set-DirectoryLink.
+    .DESCRIPTION
+        Only removes $Target if it is a junction or symbolic link. Real
+        directories are left alone with a warning. Missing targets are a
+        no-op.
+    .PARAMETER Target
+        Path to the link to remove.
+    #>
+    param([Parameter(Mandatory)][string]$Target)
+
+    if (-not (Test-Path $Target)) {
+        Write-Host "  Not present: $Target" -ForegroundColor DarkGray
+        return
+    }
+    $item = Get-Item $Target -Force
+    if ($item.LinkType -in 'Junction', 'SymbolicLink') {
+        [System.IO.Directory]::Delete($Target, $false)
+        Write-Host "  Removed link $Target" -ForegroundColor Green
+    } else {
+        Write-Host "  $Target is a regular directory, not a link; leaving it alone." -ForegroundColor Yellow
+    }
+}
+
 function Remove-HostEntries {
     <#
     .SYNOPSIS

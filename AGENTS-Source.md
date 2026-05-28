@@ -35,7 +35,7 @@ In scope:
 - The shared `AGENTS-Suffix.md` that gets appended to every consumer
   project's generated docs
 - The shared `.claude/commands/` and `.claude/skills/` folders, linked
-  into `~/.claude/{commands,skills}/agent-cli/` on the host (junction
+  into `~/.claude/{commands,skills}/team/` on the host (junction
   on Windows, symlink elsewhere) and bind-mounted to the same path
   inside Docker. Anything you drop here becomes a globally-available
   AgentCli slash command or skill.

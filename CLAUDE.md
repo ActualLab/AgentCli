@@ -37,7 +37,7 @@ In scope:
 - The shared `AGENTS-Suffix.md` that gets appended to every consumer
   project's generated docs
 - The shared `.claude/commands/` and `.claude/skills/` folders, linked
-  into `~/.claude/{commands,skills}/agent-cli/` on the host (junction
+  into `~/.claude/{commands,skills}/team/` on the host (junction
   on Windows, symlink elsewhere) and bind-mounted to the same path
   inside Docker. Anything you drop here becomes a globally-available
   AgentCli slash command or skill.
@@ -199,11 +199,22 @@ What `install` does, by host OS:
   the polyglot `c.cmd`.
 - **Linux / WSL** — same as macOS, but the alias goes into `~/.bashrc`.
 
-After the PATH/alias step, `install` triggers a Docker build of the AgentCli
-image (`claude-agentcli`). Install is idempotent — running it again only
-updates what's stale.
+After the PATH/alias step, `install` also links AgentCli's shared
+`.claude/{commands,skills}` into `~/.claude/{commands,skills}/team/` and
+triggers a Docker build of the AgentCli image (`claude-agentcli`). Install is
+idempotent — running it again only updates what's stale.
 
 Re-open the shell (or `source ~/.zshrc` / `~/.bashrc`) before using `c`.
+
+To undo everything `install` did — unregister `c`, remove the `team` links,
+stop the AgentCli docker-compose stack, and remove the AgentCli Docker image:
+
+```
+./c.ps1 uninstall
+```
+
+Uninstall leaves per-project Docker containers, generated `AGENTS.md` /
+`CLAUDE.md` files, and worktrees alone.
 
 ## Shared docker-compose stack
 

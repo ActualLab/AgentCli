@@ -53,50 +53,6 @@ function ConvertTo-SanitizedProjectName {
     return $name.Trim('_')
 }
 
-# Create or refresh a directory link: Junction on Windows (no admin needed),
-# symlink elsewhere. Idempotent — if a matching link already exists, leaves it.
-# If $Target exists as a real directory (not a link), the call is a no-op with
-# a warning so we never clobber user content.
-function Set-AgentCliLink {
-    param(
-        [Parameter(Mandatory)][string]$Source,
-        [Parameter(Mandatory)][string]$Target
-    )
-
-    if (-not (Test-Path $Source)) {
-        Write-Host "  Source not found, skipping: $Source" -ForegroundColor DarkGray
-        return
-    }
-
-    $parent = Split-Path -Parent $Target
-    if (-not (Test-Path $parent)) {
-        New-Item -ItemType Directory -Path $parent -Force | Out-Null
-    }
-
-    if (Test-Path $Target) {
-        $item = Get-Item $Target -Force
-        if ($item.LinkType -in 'Junction', 'SymbolicLink') {
-            # Safe non-recursive delete that doesn't follow the link.
-            [System.IO.Directory]::Delete($Target, $false)
-        } else {
-            Write-Host "  $Target exists as a regular directory; leaving it alone. Move/remove it manually if you want the AgentCli link." -ForegroundColor Yellow
-            return
-        }
-    }
-
-    $isWin = $IsWindows -or $env:OS -eq "Windows_NT"
-    if ($isWin) {
-        $null = New-Item -ItemType Junction -Path $Target -Value $Source -ErrorAction Stop
-    } else {
-        & ln -s $Source $Target
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "ln -s failed: $Target -> $Source"
-            return
-        }
-    }
-    Write-Host "  Linked $Target -> $Source" -ForegroundColor Green
-}
-
 # Boot-session marker — a tiny file stamped with the current OS boot time.
 # Used by the compose auto-start to avoid running `docker compose up -d`
 # more than once per OS reboot (it's a no-op when nothing changed, but still
@@ -204,10 +160,11 @@ if ($currentOS -eq "Windows" -and $hasWindowsTerminal -and -not $env:WT_SESSION 
     $hasDebug = $args -contains "--debug"
     $hasBuild = $args -contains "build"
     $hasInstall = $args -contains "install"
+    $hasUninstall = $args -contains "uninstall"
     $hasComposeStart = $args -contains "compose-start"
     $hasDryRun = $args -contains "--dry-run"
     $hasHelp = $args -contains "help" -or $args -contains "-h" -or $args -contains "--help" -or $args -contains "-?"
-    if ($hasDebug -or $hasBuild -or $hasInstall -or $hasComposeStart -or $hasDryRun -or $hasHelp) {
+    if ($hasDebug -or $hasBuild -or $hasInstall -or $hasUninstall -or $hasComposeStart -or $hasDryRun -or $hasHelp) {
         $wtArgs = @("-d", $workDir, "--", "pwsh", "-NoProfile", "-NoExit", "-File", $scriptPath) + $args
     } else {
         $wtArgs = @("-d", $workDir, "--", "pwsh", "-NoProfile", "-File", $scriptPath) + $args
@@ -461,6 +418,7 @@ function Show-Help {
     Write-Host "  chrome       Start Chrome with remote debugging enabled (for Playwright)"
     Write-Host "  build        Build the shared AgentCli Docker image (claude-<agentcli folder>)"
     Write-Host "  install      Register 'c' globally (user PATH on Windows, shell alias on Unix) and build Docker image"
+    Write-Host "  uninstall    Reverse 'install': unregister 'c', remove team links, remove the AgentCli Docker image"
     Write-Host "  compose-start Start the AgentCli docker-compose stack (chrome-devtools-mcp, etc.) — auto-runs once per OS boot"
     Write-Host "  update-md    Regenerate AGENTS.md/CLAUDE.md in cwd from AGENTS-Source.md (cwd) + AGENTS-Suffix.md (AgentCli)"
     Write-Host "  help         Show this help message"
@@ -545,7 +503,7 @@ while ($argIndex -lt $args.Count) {
     }
 
     # Check for mode commands
-    if ($currentArg -in "wsl", "os", "build", "audio", "update-md", "install", "compose-start" -and $mode -eq "docker") {
+    if ($currentArg -in "wsl", "os", "build", "audio", "update-md", "install", "uninstall", "compose-start" -and $mode -eq "docker") {
         $mode = $currentArg
         $argIndex++
         continue
@@ -754,7 +712,7 @@ if ($mode -eq "install") {
     }
 
     # Link AgentCli's .claude/{commands,skills} into the user's global Claude
-    # config under an `agent-cli` subfolder so every Claude session (Docker, WSL,
+    # config under a `team` subfolder so every Claude session (Docker, WSL,
     # or host) sees them as shared. Skipped when running inside Docker (the
     # Docker handler bind-mounts these subfolders at launch instead).
     if ($installOS -ne "Docker") {
@@ -764,8 +722,8 @@ if ($mode -eq "install") {
         $globalClaude  = Join-Path $homeForLinks ".claude"
         foreach ($folder in @("commands", "skills")) {
             $src = Join-Path $scriptDir ".claude" $folder
-            $dst = Join-Path $globalClaude $folder "agent-cli"
-            Set-AgentCliLink -Source $src -Target $dst
+            $dst = Join-Path $globalClaude $folder "team"
+            Set-DirectoryLink -Source $src -Target $dst
         }
     }
 
@@ -794,6 +752,99 @@ if ($mode -eq "install") {
 
     Write-Host ""
     Write-Host "Install complete." -ForegroundColor Green
+    exit 0
+}
+
+# Handle uninstall: undo everything `c install` did — unregister `c` from PATH/
+# shell alias, remove the team links under ~/.claude/{commands,skills}, stop the
+# AgentCli docker-compose stack, and remove the shared AgentCli Docker image.
+# Per-project Docker containers and AGENTS.md/CLAUDE.md outputs are left alone.
+if ($mode -eq "uninstall") {
+    Write-Host "Uninstalling Claude launcher..." -ForegroundColor Cyan
+    Write-Host "  Launcher dir: $scriptDir"
+
+    $installOS = Get-CurrentOS
+    Write-Host "  OS:           $installOS"
+    Write-Host ""
+
+    if ($installOS -eq "Windows") {
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $parts = @($userPath -split ';' | Where-Object { $_ -and $_.Trim() })
+        $kept  = @($parts | Where-Object { $_ -ne $scriptDir })
+        if ($kept.Count -eq $parts.Count) {
+            Write-Host "User PATH didn't contain: $scriptDir" -ForegroundColor DarkGray
+        } else {
+            [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'User')
+            Write-Host "Removed from user PATH: $scriptDir" -ForegroundColor Green
+            Write-Host "(Open a new shell for the change to take effect.)" -ForegroundColor DarkGray
+        }
+    } else {
+        $rcFile = switch ($installOS) {
+            "macOS" { Join-Path $env:HOME ".zshrc" }
+            default { Join-Path $env:HOME ".bashrc" }
+        }
+        $aliasPattern = '^\s*alias\s+c\s*='
+
+        if (-not (Test-Path $rcFile)) {
+            Write-Host "No $rcFile to update." -ForegroundColor DarkGray
+        } else {
+            $lines    = @(Get-Content -Path $rcFile -ErrorAction SilentlyContinue)
+            $filtered = @($lines | Where-Object { $_ -notmatch $aliasPattern })
+            if ($filtered.Count -eq $lines.Count) {
+                Write-Host "No 'c' alias found in $rcFile" -ForegroundColor DarkGray
+            } else {
+                Set-Content -Path $rcFile -Value $filtered
+                Write-Host "Removed alias 'c' from $rcFile" -ForegroundColor Green
+            }
+        }
+    }
+
+    if ($installOS -ne "Docker") {
+        Write-Host ""
+        Write-Host "Removing AgentCli .claude/commands and .claude/skills links..." -ForegroundColor Cyan
+        $homeForLinks  = if ($installOS -eq "Windows") { $env:USERPROFILE } else { $env:HOME }
+        $globalClaude  = Join-Path $homeForLinks ".claude"
+        foreach ($folder in @("commands", "skills")) {
+            $dst = Join-Path $globalClaude $folder "team"
+            Remove-DirectoryLink -Target $dst
+        }
+    }
+
+    if (Get-Command docker -ErrorAction SilentlyContinue) {
+        $composeFile = Join-Path $scriptDir "docker-compose.yml"
+        if (Test-Path $composeFile) {
+            Write-Host ""
+            Write-Host "Stopping AgentCli docker-compose stack..." -ForegroundColor Cyan
+            & docker compose -f $composeFile down 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "Stopped compose stack." -ForegroundColor Green
+            }
+        }
+        if (Test-Path $script:ComposeMarkerPath) {
+            Remove-Item $script:ComposeMarkerPath -Force -ErrorAction SilentlyContinue
+        }
+
+        $installProjectName = Split-Path -Leaf $scriptDir
+        $imageName = "claude-$($installProjectName.ToLower())"
+        Write-Host ""
+        Write-Host "Removing Docker image $imageName..." -ForegroundColor Cyan
+        docker image inspect $imageName 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            docker image rm -f $imageName | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "Removed Docker image: $imageName" -ForegroundColor Green
+            } else {
+                Write-Host "docker image rm exited with code $LASTEXITCODE — image may still be in use by a running container." -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "No image $imageName to remove." -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host "docker not found in PATH — skipping compose-stop and image removal." -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    Write-Host "Uninstall complete." -ForegroundColor Green
     exit 0
 }
 
@@ -2139,16 +2190,20 @@ switch ($mode) {
             }
         }
 
-        # Claude config mounts
+        # Claude config mounts. The host's ~/.claude/{commands,skills}/team links
+        # (created by `c install`) come through this parent mount. On Windows the
+        # links are NTFS junctions, which Docker Desktop resolves transparently —
+        # so AgentCli's shared commands/skills are visible without an extra mount.
+        # On Linux/macOS/WSL the links are POSIX symlinks whose target is a host
+        # path that doesn't exist inside the container, so they would dangle;
+        # we re-mount AgentCli's source folders explicitly to fill them in.
         $volumeMounts += New-VolumeMount "$homeDir/.claude" "/home/claude/.claude"
-
-        # Mount AgentCli's .claude/{commands,skills} as `agent-cli` subfolders so
-        # AgentCli-shared slash commands and skills are visible inside the container.
-        # Mounted read-only — edit them on the host (in AgentCli) instead.
-        foreach ($folder in @("commands", "skills")) {
-            $hostPath = Join-Path $scriptDir ".claude" $folder
-            if (Test-Path $hostPath) {
-                $volumeMounts += New-VolumeMount $hostPath "/home/claude/.claude/$folder/agent-cli" -ReadOnly
+        if ($currentOS -ne "Windows") {
+            foreach ($folder in @("commands", "skills")) {
+                $hostPath = Join-Path $scriptDir ".claude" $folder
+                if (Test-Path $hostPath) {
+                    $volumeMounts += New-VolumeMount $hostPath "/home/claude/.claude/$folder/team" -ReadOnly
+                }
             }
         }
 
