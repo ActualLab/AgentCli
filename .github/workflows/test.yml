@@ -1,0 +1,48 @@
+name: Run tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+    paths:
+      - "c.ps1"
+      - "scripts/Common.ps1"
+      - "tests/ps/**"
+      - ".github/workflows/test.yml"
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Pester tests
+        shell: pwsh
+        run: |
+          $config = New-PesterConfiguration
+          $config.Run.Path = "tests/ps"
+          $config.Output.Verbosity = "Detailed"
+          $config.Output.CIFormat = "GithubActions"
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = "test-results.xml"
+          $config.TestResult.OutputFormat = "JUnitXml"
+          Invoke-Pester -Configuration $config
+
+      - name: Report test results
+        uses: dorny/test-reporter@v3
+        if: success() || failure()
+        with:
+          name: Pester results (${{ matrix.os }})
+          path: test-results.xml
+          reporter: java-junit
