@@ -471,7 +471,8 @@ function Show-Help {
     Write-Host "  c chrome*3         Start 3 Chrome instances on 9222..9224 (anonymous profiles)"
     Write-Host "  c chrome*3:50000   Start 3 Chrome instances on 50000..50002 (anonymous profiles)"
     Write-Host "  c chrome --profile MyDebug"
-    Write-Host "                     Use the 'MyDebug' profile dir (sibling of Playwright); incompatible with *N"
+    Write-Host "                     Launch the 'MyDebug' user-data-dir plus any 'MyDebug-*' siblings, each an"
+    Write-Host "                     independent browser on a sequential port (9222, 9223, ...). No *N."
     Write-Host "  c chrome --mute-audio --window-size=1280,720"
     Write-Host "                     Any args after chrome[*N][:PORT] are forwarded to the browser"
     Write-Host "  c chrome --fake-media"
@@ -1765,7 +1766,12 @@ function Start-DebugBrowsers {
     #                      with <name>. Sibling of the default profile dir if
     #                      <name> is a bare name, or an absolute path if rooted.
     #                      Incompatible with multi-instance (*N) — each instance
-    #                      needs its own --user-data-dir.
+    #                      needs its own --user-data-dir. Launches <name> plus any
+    #                      "<name>-*" sibling user-data-dirs (each a normal
+    #                      single-profile dir), each as an independent browser on
+    #                      its own sequential port (<name> first on $StartPort,
+    #                      siblings next). Separate user-data-dirs => separate
+    #                      processes => separate debug ports.
     $useFakeMedia = $false
     $profileName = $null
     $forwardedArgs = @()
@@ -1834,9 +1840,38 @@ function Start-DebugBrowsers {
             }
         }
     }
-    for ($i = 0; $i -lt $Count; $i++) {
-        $port = $StartPort + $i
-        $profileDir = if ($UseAnonymous) { "$AnonProfileBase-$port" } else { $DefaultProfileDir }
+    # Build the launch plan. Every entry is one independent browser process with
+    # its own --user-data-dir and its own sequential debug port (StartPort + i):
+    #  - --profile <name>: launch <name> plus any "<name>-*" sibling
+    #    user-data-dirs (each a normal single-profile dir), ordered <name> first
+    #    then siblings alphabetically. Separate dirs => separate processes =>
+    #    separate ports, so each profile is independently debuggable.
+    #  - otherwise: the prior per-instance behavior (anonymous *N = one process
+    #    + port + user-data-dir each; default = a single Playwright launch).
+    $plan = @()
+    if ($profileName) {
+        $base   = Split-Path -Leaf $DefaultProfileDir
+        $parent = Split-Path -Parent $DefaultProfileDir
+        $dirs = @(Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue |
+            Where-Object { ($_.Name -eq $base -or $_.Name -like "$base-*") -and (Test-Path (Join-Path $_.FullName "Default")) })
+        $uddPaths = @()
+        $uddPaths += @($dirs | Where-Object { $_.Name -eq $base } | ForEach-Object { $_.FullName })
+        $uddPaths += @($dirs | Where-Object { $_.Name -ne $base } | Sort-Object Name | ForEach-Object { $_.FullName })
+        if ($uddPaths.Count -eq 0) { $uddPaths = @($DefaultProfileDir) }   # first run: base dir not created yet
+        Write-Host "Profile dirs for '$base': $((($uddPaths | ForEach-Object { Split-Path -Leaf $_ })) -join ', ')" -ForegroundColor DarkGray
+        for ($pi = 0; $pi -lt $uddPaths.Count; $pi++) {
+            $plan += [pscustomobject]@{ Port = $StartPort + $pi; UserDataDir = $uddPaths[$pi] }
+        }
+    } else {
+        for ($pi = 0; $pi -lt $Count; $pi++) {
+            $udd = if ($UseAnonymous) { "$AnonProfileBase-$($StartPort + $pi)" } else { $DefaultProfileDir }
+            $plan += [pscustomobject]@{ Port = $StartPort + $pi; UserDataDir = $udd }
+        }
+    }
+
+    foreach ($spec in $plan) {
+        $port = $spec.Port
+        $profileDir = $spec.UserDataDir
 
         Ensure-FirewallRule -Port $port -BrowserName $BrowserName
 
@@ -1887,6 +1922,8 @@ function Start-DebugBrowsers {
             "--remote-debugging-address=0.0.0.0",
             "--user-data-dir=`"$profileDir`"",
             "--remote-allow-origins=*",
+            "--no-first-run",
+            "--no-default-browser-check",
             "--disable-notifications",
             "--use-fake-ui-for-media-stream",
             "--auto-select-desktop-capture-source=Voxt",
