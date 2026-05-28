@@ -502,8 +502,10 @@ while ($argIndex -lt $args.Count) {
         continue
     }
 
-    # Check for mode commands
-    if ($currentArg -in "wsl", "os", "build", "audio", "update-md", "install", "uninstall", "compose-start" -and $mode -eq "docker") {
+    # Check for mode commands. "docker" is accepted as an explicit no-op (mode
+    # is already the default) for symmetry with "os" / "wsl" in scripts that
+    # pass the mode unconditionally.
+    if ($currentArg -in "docker", "wsl", "os", "build", "audio", "update-md", "install", "uninstall", "compose-start" -and $mode -eq "docker") {
         $mode = $currentArg
         $argIndex++
         continue
