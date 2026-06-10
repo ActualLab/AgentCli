@@ -121,7 +121,7 @@ RUN playwright install chromium
 
 # Install Claude Code CLI (native installer, auto-update disabled at runtime)
 ENV DISABLE_AUTOUPDATER=1
-RUN curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.160
+RUN curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.170
 
 # Install OpenAI Codex CLI (npm global, lands in /usr/local/share/npm-global/bin)
 RUN npm install -g @openai/codex
