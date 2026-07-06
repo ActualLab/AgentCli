@@ -1047,7 +1047,8 @@ class WorktreeServer {
             @(
                 "$($this.InstanceName).local.voxt.ai",
                 "cdn-$($this.InstanceName).local.voxt.ai",
-                "media-$($this.InstanceName).local.voxt.ai"
+                "media-$($this.InstanceName).local.voxt.ai",
+                "maps-$($this.InstanceName).local.voxt.ai"
             )
         } else { @() }
 
