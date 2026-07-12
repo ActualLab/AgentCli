@@ -2307,10 +2307,12 @@ switch ($mode) {
                 if ($env:AC_HOST_PROXY_PORTS) {
                     foreach ($p in ($env:AC_HOST_PROXY_PORTS -split ',' | Where-Object { $_.Trim() })) {
                         $p = $p.Trim()
-                        Start-Process -NoNewWindow -FilePath socat -ArgumentList @(
-                            "TCP-LISTEN:$p,fork,reuseaddr,bind=127.0.0.1",
-                            "TCP:host.docker.internal:$p"
-                        ) | Out-Null
+                        # -d0 = errors only, which silences socat's noisy per-fork
+                        # "waitpid(...): no child has exited" warnings; stdout+stderr are
+                        # also routed to /dev/null so the forwarder produces zero console
+                        # output that would otherwise clobber the agent's TUI.
+                        $socatCmd = "exec socat -d0 TCP-LISTEN:$p,fork,reuseaddr,bind=127.0.0.1 TCP:host.docker.internal:$p >/dev/null 2>&1"
+                        Start-Process -NoNewWindow -FilePath "sh" -ArgumentList @("-c", $socatCmd) | Out-Null
                         Write-Host "Host proxy: localhost:$p -> host.docker.internal:$p" -ForegroundColor DarkGray
                     }
                 }
