@@ -2616,15 +2616,21 @@ switch ($mode) {
             "-e", "PULSE_SERVER=$pulseServer"
         )
 
-        # Host-port proxies: on Docker Desktop (Windows/macOS) --network host binds
+        # Host-port proxies (macOS only). On Docker Desktop --network host attaches
         # the container to the Linux VM's netns, not the host, so host-only services
         # (e.g. LM Studio) aren't at localhost. The in-container startup runs a socat
         # forwarder per listed port so localhost:<port> reaches host.docker.internal:<port>.
-        # Native-Linux docker needs nothing — there localhost already IS the host.
-        # (LM Studio must still serve on the network / bind 0.0.0.0, since
-        # host.docker.internal maps to a non-loopback host IP.)
+        # (LM Studio must serve on 0.0.0.0, since host.docker.internal is a non-loopback IP.)
+        #
+        # NOT used on Windows: there we rely on WSL mirrored networking
+        # (.wslconfig -> networkingMode=mirrored), which makes Docker Desktop's WSL2
+        # backend share the Windows loopback — so --network host reaches the host's
+        # localhost:1234 directly (LM Studio can stay bound to 127.0.0.1). Running the
+        # proxy there is worse than useless: socat would bind :1234 on the shared
+        # loopback and its host.docker.internal:1234 upstream loops back onto itself.
+        # Native-Linux docker also needs nothing — localhost already IS the host.
         $hostProxyEnvVars = @()
-        if ($cli -in "goose", "opencode" -and $currentOS -in "Windows", "macOS") {
+        if ($cli -in "goose", "opencode" -and $currentOS -eq "macOS") {
             $lmStudioPort = if ($env:AC_LMSTUDIO_PORT) { $env:AC_LMSTUDIO_PORT } else { "1234" }
             $hostProxyEnvVars = @("-e", "AC_HOST_PROXY_PORTS=$lmStudioPort")
         }
