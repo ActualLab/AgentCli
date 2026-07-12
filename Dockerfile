@@ -20,7 +20,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 # Install dev tools, CLI utilities, Python 3, image tools, audio support
 RUN apt-get update && apt-get install -y \
     git git-lfs procps sudo fzf zsh man-db unzip bzip2 gnupg2 \
-    gh jq wget curl less ca-certificates openssh-client \
+    gh jq wget curl less ca-certificates openssh-client socat \
     python3 python3-pip python3-venv \
     imagemagick \
     ripgrep fd-find vim nano \

@@ -237,11 +237,11 @@ When running in Docker (`AC_OS` = `Linux in Docker`), the following tools are av
 
 When running in Docker, `/proj/<CurrentProject>/artifacts` path is mapped to `artifacts/claude-docker/` path in the OS's file system to avoid permission conflicts with the host.
 
-**Host service connectivity**: The Docker container uses `--network host` mode, so `localhost` inside the container directly refers to the host. This means you can connect to host services (Redis, PostgreSQL, NATS, etc.) using `localhost:port` just like on the host. On macOS, `--network host` requires Docker Desktop 4.34+ (Sept 2024).
+**Host service connectivity**: The Docker container uses `--network host` mode. On **native Linux** this makes `localhost` inside the container refer to the host directly, so you reach host services (Redis, PostgreSQL, NATS, etc.) at `localhost:port`. On **Docker Desktop (Windows/macOS)** `--network host` attaches the container to the Linux VM's network namespace, **not** the host — so `localhost:port` hits the VM, and host services must be reached via `host.docker.internal:port` (and the host service must bind `0.0.0.0`, not just loopback). On macOS, `--network host` requires Docker Desktop 4.34+ (Sept 2024).
 
 **macOS / Apple Silicon**: The Docker image supports both amd64 and arm64 architectures. `ai.cmd` (and the `ai-codex.cmd` / `ai-grok.cmd` / `ai-goose.cmd` shortcuts) are polyglot scripts that work on both Windows and macOS/Linux.
 
-**Goose config**: When you launch the `goose` agent, the launcher passes your host goose config to the sandboxed/WSL goose so its provider setup (e.g. a local LM Studio endpoint) carries over. In Docker the host goose config dir (`%APPDATA%\Block\goose\config` on Windows, `~/.config/goose` elsewhere) is bind-mounted read-only to `/home/claude/.config/goose`; in WSL the `config.yaml` is copied into the WSL user's `~/.config/goose/`. With `--network host`, a `localhost:1234` LM Studio endpoint in that config reaches the host directly.
+**Goose config**: When you launch the `goose` agent, the launcher passes your host goose config to the sandboxed/WSL goose so its provider setup (e.g. a local LM Studio endpoint) carries over. In Docker the host goose config dir (`%APPDATA%\Block\goose\config` on Windows, `~/.config/goose` elsewhere) is bind-mounted read-only to `/home/claude/.config/goose`; in WSL the `config.yaml` is copied into the WSL user's `~/.config/goose/`. A `localhost:1234` LM Studio endpoint in that config works unchanged: on native-Linux Docker `--network host` already makes localhost the host; on Docker Desktop (Windows/macOS) the launcher starts an in-container `socat` forwarder so `localhost:1234` reaches `host.docker.internal:1234` (override the port with `AC_LMSTUDIO_PORT`; LM Studio must serve on `0.0.0.0`). In WSL, use mirrored networking mode (`.wslconfig` → `networkingMode=mirrored`) so `localhost` is shared with Windows.
 
 **Propagated environment variables**: The following environment variables are automatically propagated from the host to the Docker container:
 - Variables containing `__` in their names (e.g., `ChatSettings__OpenAIApiKey` for .NET configuration)
@@ -323,8 +323,8 @@ The behavior splits along the Docker vs. OS/WSL line:
      `/proj/<sibling>` as usual.
 
 The Docker image (`claude-<AgentCli folder>`) is **shared by every project** —
-there is no per-project `claude.Dockerfile` anymore. The image is built by
-`ai install` or `ai build` (always against AgentCli's own `claude.Dockerfile`).
+there is no per-project `Dockerfile` anymore. The image is built by
+`ai install` or `ai build` (always against AgentCli's own `Dockerfile`).
 
 ## Editing AGENTS.md / CLAUDE.md
 

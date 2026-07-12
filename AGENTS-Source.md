@@ -1,7 +1,7 @@
 # AgentCli
 
 AgentCli is the **single** home of the multi-agent launcher (`ai.ps1`), its
-PowerShell helpers (`scripts/Common.ps1`), the shared `claude.Dockerfile`,
+PowerShell helpers (`scripts/Common.ps1`), the shared `Dockerfile`,
 the shared `AGENTS-Suffix.md`, and the shared `.claude/commands/` +
 `.claude/skills/` folders. Nothing AgentCli-related lives in any other
 repo — the only per-project file is `AGENTS-Source.md`, which holds the
@@ -27,7 +27,7 @@ all launcher-related files; consumer projects never carry a copy.
 In scope:
 - `ai.ps1` and its PowerShell helpers (`scripts/`); the `ai.cmd` /
   `ai-codex.cmd` / `ai-grok.cmd` / `ai-goose.cmd` entry points
-- `claude.Dockerfile` — the **single shared** Docker image used by every
+- `Dockerfile` — the **single shared** Docker image used by every
   project (Claude + Codex + Grok + Goose CLIs all pre-installed)
 - WSL and direct-on-host launch paths
 - Worktree detection (`AC_Worktree`, `ai wt …`)

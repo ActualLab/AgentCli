@@ -827,9 +827,9 @@ if ($mode -eq "install") {
     # directory) so install works from anywhere.
     Write-Host ""
     Write-Host "Building Docker image..." -ForegroundColor Cyan
-    $dockerfilePath = Join-Path $scriptDir "claude.Dockerfile"
+    $dockerfilePath = Join-Path $scriptDir "Dockerfile"
     if (-not (Test-Path $dockerfilePath)) {
-        Write-Host "No claude.Dockerfile at $dockerfilePath — skipping build." -ForegroundColor Yellow
+        Write-Host "No Dockerfile at $dockerfilePath — skipping build." -ForegroundColor Yellow
         exit 0
     }
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
@@ -2085,7 +2085,7 @@ switch ($mode) {
     "build" {
         # Build the shared AgentCli Docker image (used by every project).
         $imageName     = "claude-$($agentCliFolderName.ToLower())"
-        $dockerfilePath = Join-Path $scriptDir "claude.Dockerfile"
+        $dockerfilePath = Join-Path $scriptDir "Dockerfile"
         Write-Host "Building Docker image: $imageName"
         Write-Host "  Dockerfile: $dockerfilePath"
         if (-not $dryRun) {
@@ -2271,6 +2271,19 @@ switch ($mode) {
                     & chmod 700 $sshDir
                     & sh -c "chmod 600 $sshDir/* 2>/dev/null; chmod 644 $sshDir/*.pub $sshDir/known_hosts $sshDir/config 2>/dev/null; true"
                 }
+                # Host-port proxies (set by the outer launcher on Docker Desktop hosts):
+                # forward localhost:<port> -> host.docker.internal:<port> so config that
+                # points at localhost (e.g. goose's LM Studio endpoint) reaches the host.
+                if ($env:AC_HOST_PROXY_PORTS) {
+                    foreach ($p in ($env:AC_HOST_PROXY_PORTS -split ',' | Where-Object { $_.Trim() })) {
+                        $p = $p.Trim()
+                        Start-Process -NoNewWindow -FilePath socat -ArgumentList @(
+                            "TCP-LISTEN:$p,fork,reuseaddr,bind=127.0.0.1",
+                            "TCP:host.docker.internal:$p"
+                        ) | Out-Null
+                        Write-Host "Host proxy: localhost:$p -> host.docker.internal:$p" -ForegroundColor DarkGray
+                    }
+                }
                 $allArgs = @($cliBaseArgs) + @($cliSandboxedArgs) + $cliArgs
                 & $cliCommand @allArgs
                 if ($debugMode) {
@@ -2429,9 +2442,10 @@ switch ($mode) {
         # container reads ~/.config/goose/config.yaml; the host folder that DIRECTLY
         # holds config.yaml is OS-specific (%APPDATA%\Block\goose\config on Windows,
         # ~/.config/goose elsewhere), so it maps 1:1 onto the container path.
-        # Read-only — the container's LM Studio / provider setup carries over. With
-        # --network host, the config's localhost:1234 LM Studio endpoint reaches the
-        # host directly.
+        # Read-only — the container's LM Studio / provider setup carries over. The
+        # config's localhost:1234 endpoint is made reachable by the host-port proxy
+        # below (Docker Desktop's --network host attaches to the Linux VM, not the
+        # Windows/macOS host, so localhost:1234 would otherwise hit nothing).
         if ($cli -eq "goose") {
             $gooseConfigDir = Get-GooseConfigDir
             if ($gooseConfigDir) {
@@ -2559,7 +2573,20 @@ switch ($mode) {
             "-e", "PULSE_SERVER=$pulseServer"
         )
 
-        $dockerArgs += $volumeMounts + $propagatedEnvVars + $audioEnvVars + @(
+        # Host-port proxies: on Docker Desktop (Windows/macOS) --network host binds
+        # the container to the Linux VM's netns, not the host, so host-only services
+        # (e.g. LM Studio) aren't at localhost. The in-container startup runs a socat
+        # forwarder per listed port so localhost:<port> reaches host.docker.internal:<port>.
+        # Native-Linux docker needs nothing — there localhost already IS the host.
+        # (LM Studio must still serve on the network / bind 0.0.0.0, since
+        # host.docker.internal maps to a non-loopback host IP.)
+        $hostProxyEnvVars = @()
+        if ($cli -eq "goose" -and $currentOS -in "Windows", "macOS") {
+            $lmStudioPort = if ($env:AC_LMSTUDIO_PORT) { $env:AC_LMSTUDIO_PORT } else { "1234" }
+            $hostProxyEnvVars = @("-e", "AC_HOST_PROXY_PORTS=$lmStudioPort")
+        }
+
+        $dockerArgs += $volumeMounts + $propagatedEnvVars + $audioEnvVars + $hostProxyEnvVars + @(
             "-e", "ANTHROPIC_API_KEY=$env:ANTHROPIC_API_KEY"
             "-e", "DISABLE_AUTOUPDATER=1"
             "-e", "DOTNET_SYSTEM_NET_DISABLEIPV6=1"
