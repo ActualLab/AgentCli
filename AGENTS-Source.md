@@ -1,19 +1,21 @@
 # AgentCli
 
-AgentCli is the **single** home of the multi-CLI launcher (`c.ps1`), its
+AgentCli is the **single** home of the multi-agent launcher (`ai.ps1`), its
 PowerShell helpers (`scripts/Common.ps1`), the shared `claude.Dockerfile`,
 the shared `AGENTS-Suffix.md`, and the shared `.claude/commands/` +
 `.claude/skills/` folders. Nothing AgentCli-related lives in any other
 repo — the only per-project file is `AGENTS-Source.md`, which holds the
 project's local content and is appended in front of AgentCli's suffix
-when `c update-md` regenerates `AGENTS.md` / `CLAUDE.md`.
+when `ai update-md` regenerates `AGENTS.md` / `CLAUDE.md`.
 
-`c.ps1` works from any current directory and operates on whatever folder
+`ai.ps1` works from any current directory and operates on whatever folder
 it was started in — the launched CLI session targets the caller's working
 directory, not AgentCli's. The Docker image (`claude-agentcli`) bundles
-Claude Code, OpenAI Codex, and xAI Grok side by side; `c.ps1` picks which
-one to run via its first positional arg (`c claude` / `c codex` / `c grok`,
-default `claude`).
+Claude Code, OpenAI Codex, xAI Grok, and Codename Goose side by side;
+`ai.ps1` picks which one to run via its first positional arg or the
+`--agent:` option (`ai claude` / `ai codex` / `ai grok` / `ai goose`,
+default `claude`). `ai-codex` / `ai-grok` / `ai-goose` are one-agent shortcuts
+(`= ai --agent:<name>`).
 
 ## Status
 
@@ -23,11 +25,12 @@ all launcher-related files; consumer projects never carry a copy.
 ## Scope of this project
 
 In scope:
-- `c.ps1` and its PowerShell helpers (`scripts/`)
+- `ai.ps1` and its PowerShell helpers (`scripts/`); the `ai.cmd` /
+  `ai-codex.cmd` / `ai-grok.cmd` / `ai-goose.cmd` entry points
 - `claude.Dockerfile` — the **single shared** Docker image used by every
-  project (Claude + Codex + Grok CLIs all pre-installed)
+  project (Claude + Codex + Grok + Goose CLIs all pre-installed)
 - WSL and direct-on-host launch paths
-- Worktree detection (`AC_Worktree`, `c wt …`)
+- Worktree detection (`AC_Worktree`, `ai wt …`)
 - Out-of-tree launch support (sanitized `/proj/<path>` mount + extra
   mount inside Docker; OS/WSL just use the real path)
 - Environment-variable contract documented in the launcher section of

@@ -1,6 +1,6 @@
 # AgentCli sandbox environment for ActualLab projects
 # Supports: ActualLab.Fusion, ActualLab.Fusion.Samples, ActualChat
-# Includes: .NET 10 SDK, .NET 9 SDK, Node.js 20, Claude Code + Codex + Grok CLIs
+# Includes: .NET 10 SDK, .NET 9 SDK, Node.js 20, Claude Code + Codex + Grok + Goose CLIs
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0.202
 
@@ -19,7 +19,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 
 # Install dev tools, CLI utilities, Python 3, image tools, audio support
 RUN apt-get update && apt-get install -y \
-    git git-lfs procps sudo fzf zsh man-db unzip gnupg2 \
+    git git-lfs procps sudo fzf zsh man-db unzip bzip2 gnupg2 \
     gh jq wget curl less ca-certificates openssh-client \
     python3 python3-pip python3-venv \
     imagemagick \
@@ -129,6 +129,25 @@ RUN npm install -g @openai/codex
 # Install Grok CLI from x.ai. The installer writes to $HOME/.local/bin, which is
 # already first on PATH for this user (see the ENV PATH= line above).
 RUN curl -fsSL https://x.ai/cli/install.sh | bash
+
+# Install Codename Goose CLI (block/goose). We download the release tarball
+# directly (arch-aware, with retries) rather than via download_cli.sh: that
+# script falls back to a broken URL on any transient failure of the primary
+# download. goose reads its config from ~/.config/goose/config.yaml, which
+# ai.ps1 bind-mounts from the host at launch. Lands in $HOME/.local/bin
+# (already first on PATH for this user).
+RUN ARCH=$(dpkg --print-architecture) && \
+    case "$ARCH" in \
+      amd64) GOOSE_ARCH=x86_64 ;; \
+      arm64) GOOSE_ARCH=aarch64 ;; \
+      *) echo "Unsupported architecture for goose: $ARCH" && exit 1 ;; \
+    esac && \
+    curl --retry 5 --retry-all-errors -fsSL \
+      "https://github.com/block/goose/releases/download/stable/goose-${GOOSE_ARCH}-unknown-linux-gnu.tar.bz2" \
+      -o /tmp/goose.tar.bz2 && \
+    tar -xjf /tmp/goose.tar.bz2 -C "$HOME/.local/bin" && \
+    rm /tmp/goose.tar.bz2 && \
+    goose --version
 
 # Default working directory (overridden by -w flag in docker run)
 WORKDIR /proj

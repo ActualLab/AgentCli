@@ -6,7 +6,7 @@ on:
     branches:
       - "**"
     paths:
-      - "c.ps1"
+      - "ai.ps1"
       - "scripts/Common.ps1"
       - "tests/ps/**"
       - ".github/workflows/test.yml"

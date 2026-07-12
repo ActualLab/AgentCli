@@ -5,13 +5,13 @@ Describe "PulseAudioSetup on $currentOS" {
     BeforeAll {
         . "$PSScriptRoot/../../../scripts/Common.ps1"
 
-        # Source PulseAudioSetup class from c.ps1 by extracting just the class definition
-        $scriptContent = Get-Content "$PSScriptRoot/../../../c.ps1" -Raw
+        # Source PulseAudioSetup class from ai.ps1 by extracting just the class definition
+        $scriptContent = Get-Content "$PSScriptRoot/../../../ai.ps1" -Raw
         $classPattern = '(?s)(class PulseAudioSetup \{.+?\n\})'
         if ($scriptContent -match $classPattern) {
             Invoke-Expression $Matches[1]
         } else {
-            throw "Could not find PulseAudioSetup class in c.ps1"
+            throw "Could not find PulseAudioSetup class in ai.ps1"
         }
 
         $pa = [PulseAudioSetup]::new()

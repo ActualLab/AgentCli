@@ -1,8 +1,8 @@
 #!/usr/bin/env pwsh
-# Claude launcher script - runs Claude in Docker, WSL, or native OS
+# AgentCli launcher script - runs Claude / Codex / Grok / Goose in Docker, WSL, or native OS
 
 # Auto-detect AC_ProjectRoot from the folder containing this script
-# e.g., if c.ps1 is at D:\Projects\ActualChat\c.ps1, AC_ProjectRoot = D:\Projects
+# e.g., if ai.ps1 is at D:\Projects\ActualChat\ai.ps1, AC_ProjectRoot = D:\Projects
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $env:AC_ProjectRoot) {
     $env:AC_ProjectRoot = Split-Path -Parent $scriptDir
@@ -51,6 +51,21 @@ function ConvertTo-SanitizedProjectName {
     $name = $Path -replace '[\\/:]+', '_'
     $name = $name -replace '_+', '_'
     return $name.Trim('_')
+}
+
+# Returns the host directory that DIRECTLY contains goose's config.yaml, or $null
+# if it doesn't exist. Layout differs by OS:
+#   Windows: %APPDATA%\Block\goose\config
+#   macOS/Linux: ~/.config/goose  (XDG)
+# The WSL/Docker handlers pass this into the Linux goose, which always reads
+# ~/.config/goose/config.yaml — so the folder maps 1:1 regardless of host layout.
+function Get-GooseConfigDir {
+    $dir = switch (Get-CurrentOS) {
+        "Windows" { Join-Path $env:APPDATA "Block/goose/config" }
+        default   { Join-Path $env:HOME ".config/goose" }
+    }
+    if (Test-Path (Join-Path $dir "config.yaml")) { return $dir }
+    return $null
 }
 
 # Boot-session marker — a tiny file stamped with the current OS boot time.
@@ -364,7 +379,7 @@ function Find-ProjectRoot {
 
 # Main logic
 $currentOS             = Get-CurrentOS
-$cli                   = "claude" # default CLI (claude | codex | grok)
+$cli                   = "claude" # default CLI/agent (claude | codex | grok | goose)
 $mode                  = "docker"  # default mode
 $fromMode              = $null     # set when self-invoked (e.g., from-docker, from-wsl)
 $worktreeSuffix        = $null     # set when wt argument is used
@@ -377,35 +392,67 @@ $debugMode             = $false
 $cliSet                = $false  # true once an explicit CLI has been consumed from args
 $cliArgs               = @()
 
-# CLI registry — each supported CLI maps to its executable name and the args
-# used in "yolo" mode (i.e. inside the sandboxed Docker container). On the
-# host OS we never add these flags, so each CLI runs interactively with its
-# usual approval prompts.
+# CLI/agent registry. Each supported agent maps to:
+#   Command       - the executable name
+#   BaseArgs      - args ALWAYS prepended (e.g. a subcommand like `goose session`)
+#   SandboxedArgs - extra args added only in "yolo" mode (inside the sandboxed
+#                   Docker container). On the host OS these are never added, so
+#                   each CLI runs interactively with its usual approval prompts.
+#   SandboxedEnv  - env vars set only in the sandboxed Docker container (some
+#                   CLIs — e.g. goose — gate auto-approval via env, not a flag).
 $CliConfig = @{
     "claude" = @{
         Command       = "claude"
+        BaseArgs      = @()
         SandboxedArgs = @("--dangerously-skip-permissions")
+        SandboxedEnv  = @{}
     }
     "codex" = @{
         Command       = "codex"
+        BaseArgs      = @()
         SandboxedArgs = @("--full-auto")
+        SandboxedEnv  = @{}
     }
     "grok" = @{
         Command       = "grok"
+        BaseArgs      = @()
         SandboxedArgs = @()
+        SandboxedEnv  = @{}
+    }
+    "goose" = @{
+        Command       = "goose"
+        BaseArgs      = @("session")                 # interactive chat session
+        SandboxedArgs = @()
+        SandboxedEnv  = @{
+            "GOOSE_MODE"            = "auto"          # auto-approve tool calls in the sandbox
+            "GOOSE_DISABLE_KEYRING" = "1"            # no OS keyring in a headless container; use the config file
+        }
     }
 }
 
+# Valid agent names — accepted both as the positional selector (`ai codex`) and
+# as the --agent value (`ai --agent:codex`). The ai-codex/ai-grok/ai-goose
+# entry-point shortcuts (ai-codex.cmd/…) each pin one via `ai --agent=<name>`.
+$ValidAgents = @("claude", "codex", "grok", "goose")
+
 # Show help
 function Show-Help {
-    Write-Host "AgentCli Launcher - Run Claude / Codex / Grok in Docker, WSL, or native OS" -ForegroundColor Cyan
+    Write-Host "AgentCli Launcher - Run Claude / Codex / Grok / Goose in Docker, WSL, or native OS" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "Usage: c [cli] [command] [options] [cli-args]" -ForegroundColor Yellow
+    Write-Host "Usage: ai [agent] [command] [options] [cli-args]" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "CLIs (first positional arg, default: claude):"
+    Write-Host "Agents (first positional arg or --agent:<name>, default: claude):"
     Write-Host "  claude       Anthropic Claude Code (default)"
     Write-Host "  codex        OpenAI Codex"
     Write-Host "  grok         xAI Grok"
+    Write-Host "  goose        Codename Goose (block/goose)"
+    Write-Host ""
+    Write-Host "Entry points / shortcuts:"
+    Write-Host "  ai           This launcher (Claude by default; pick agent via positional arg or --agent:)"
+    Write-Host "  ai-codex     Shortcut for 'ai --agent:codex'"
+    Write-Host "  ai-grok      Shortcut for 'ai --agent:grok'"
+    Write-Host "  ai-goose     Shortcut for 'ai --agent:goose'"
+    Write-Host "  --agent:<n>  Select agent (claude|codex|grok|goose)"
     Write-Host ""
     Write-Host "Commands:"
     Write-Host "  (default)    Run selected CLI in Docker container"
@@ -417,8 +464,8 @@ function Show-Help {
     Write-Host "  rwt <suffix> Remove worktree and clean up (ports, hosts, nginx config)"
     Write-Host "  chrome       Start Chrome with remote debugging enabled (for Playwright)"
     Write-Host "  build        Build the shared AgentCli Docker image (claude-<agentcli folder>)"
-    Write-Host "  install      Register 'c' globally (user PATH on Windows, shell alias on Unix) and build Docker image"
-    Write-Host "  uninstall    Reverse 'install': unregister 'c', remove team links, remove the AgentCli Docker image"
+    Write-Host "  install      Register 'ai'/'ai-codex'/'ai-grok'/'ai-goose' globally (user PATH on Windows, shell aliases on Unix) and build Docker image"
+    Write-Host "  uninstall    Reverse 'install': unregister those entry points, remove team links, remove the AgentCli Docker image"
     Write-Host "  compose-start Start the AgentCli docker-compose stack (chrome-devtools-mcp, etc.) — auto-runs once per OS boot"
     Write-Host "  update-md    Regenerate AGENTS.md/CLAUDE.md in cwd from AGENTS-Source.md (cwd) + AGENTS-Suffix.md (AgentCli)"
     Write-Host "  help         Show this help message"
@@ -451,52 +498,88 @@ function Show-Help {
     Write-Host "  Base branch for fwt/bwt: 'dev' if it exists on origin, otherwise 'master'"
     Write-Host ""
     Write-Host "Examples:"
-    Write-Host "  c                  Run Claude in Docker (claude is the default CLI)"
-    Write-Host "  c claude           Same as 'c' - explicit Claude in Docker"
-    Write-Host "  c codex            Run Codex in Docker"
-    Write-Host "  c grok             Run Grok in Docker"
-    Write-Host "  c --dry-run        Show what Docker would run"
-    Write-Host "  c os               Run Claude on host OS (default CLI)"
-    Write-Host "  c codex os         Run Codex on host OS"
-    Write-Host "  c grok wsl         Run Grok in WSL"
-    Write-Host "  c claude wsl       Run Claude in WSL (explicit)"
-    Write-Host "  c wt experiment    Run in worktree from current branch"
-    Write-Host "  c fwt feature1     Run in worktree with feat/feature1 branch"
-    Write-Host "  c bwt issue123     Run in worktree with bugfix/issue123 branch"
-    Write-Host "  c rwt feature1     Remove feature1 worktree and clean up"
-    Write-Host "  c os fwt feature1  Run on host OS in feature worktree"
-    Write-Host "  c os bwt issue1    Run on host OS in bugfix worktree"
-    Write-Host "  c chrome           Start Chrome with remote debugging (Playwright profile, port 9222)"
-    Write-Host "  c chrome:50000     Start Chrome on port 50000 (Playwright profile)"
-    Write-Host "  c chrome*3         Start 3 Chrome instances on 9222..9224 (anonymous profiles)"
-    Write-Host "  c chrome*3:50000   Start 3 Chrome instances on 50000..50002 (anonymous profiles)"
-    Write-Host "  c chrome --profile MyDebug"
+    Write-Host "  ai                 Run Claude in Docker (claude is the default agent)"
+    Write-Host "  ai-codex           Shortcut: Codex in Docker (= ai --agent:codex)"
+    Write-Host "  ai-grok            Shortcut: Grok in Docker (= ai --agent:grok)"
+    Write-Host "  ai-goose           Shortcut: Goose in Docker (= ai --agent:goose)"
+    Write-Host "  ai goose           Run Goose in Docker (positional form)"
+    Write-Host "  ai --agent:goose   Select Goose explicitly"
+    Write-Host "  ai --dry-run       Show what Docker would run"
+    Write-Host "  ai os              Run Claude on host OS (default agent)"
+    Write-Host "  ai-codex os        Run Codex on host OS"
+    Write-Host "  ai-goose wsl       Run Goose in WSL"
+    Write-Host "  ai wsl             Run Claude in WSL"
+    Write-Host "  ai wt experiment   Run in worktree from current branch"
+    Write-Host "  ai fwt feature1    Run in worktree with feat/feature1 branch"
+    Write-Host "  ai bwt issue123    Run in worktree with bugfix/issue123 branch"
+    Write-Host "  ai rwt feature1    Remove feature1 worktree and clean up"
+    Write-Host "  ai os fwt feature1 Run on host OS in feature worktree"
+    Write-Host "  ai chrome          Start Chrome with remote debugging (Playwright profile, port 9222)"
+    Write-Host "  ai chrome:50000    Start Chrome on port 50000 (Playwright profile)"
+    Write-Host "  ai chrome*3        Start 3 Chrome instances on 9222..9224 (anonymous profiles)"
+    Write-Host "  ai chrome*3:50000  Start 3 Chrome instances on 50000..50002 (anonymous profiles)"
+    Write-Host "  ai chrome --profile MyDebug"
     Write-Host "                     Launch the 'MyDebug' user-data-dir plus any 'MyDebug-*' siblings, each an"
     Write-Host "                     independent browser on a sequential port (9222, 9223, ...). No *N."
-    Write-Host "  c chrome --mute-audio --window-size=1280,720"
+    Write-Host "  ai chrome --mute-audio --window-size=1280,720"
     Write-Host "                     Any args after chrome[*N][:PORT] are forwarded to the browser"
-    Write-Host "  c chrome --fake-media"
+    Write-Host "  ai chrome --fake-media"
     Write-Host "                     Use synthetic camera/mic streams (default is real devices)"
-    Write-Host "  c edge[:PORT][*N]  Same as chrome, for Microsoft Edge (default port 9322)"
-    Write-Host "  c audio            Setup/start PulseAudio for voice mode (macOS only)"
-    Write-Host "  c build            Build Docker image"
-    Write-Host "  c install          Register 'c' globally and build the Docker image (run once after cloning AgentCli)"
-    Write-Host "  c --resume abc     Pass --resume abc to the selected CLI"
+    Write-Host "  ai edge[:PORT][*N] Same as chrome, for Microsoft Edge (default port 9322)"
+    Write-Host "  ai audio           Setup/start PulseAudio for voice mode (macOS only)"
+    Write-Host "  ai build           Build Docker image"
+    Write-Host "  ai install         Register 'ai'/'ai-codex'/'ai-grok'/'ai-goose' globally and build the Docker image (run once after cloning AgentCli)"
+    Write-Host "  ai --resume abc    Pass --resume abc to the selected agent"
     Write-Host ""
 }
 
 # Parse arguments
-# All c.ps1 commands must come first, then all remaining args go to the selected CLI
+# All ai.ps1 commands must come first, then all remaining args go to the selected CLI
 $argIndex = 0
 
-# Parse c.ps1 commands (cli, mode, wt, from-*, --dry-run) - must come before CLI args
+# Parse ai.ps1 commands (agent, mode, wt, from-*, --dry-run) - must come before CLI args
 while ($argIndex -lt $args.Count) {
     $currentArg = $args[$argIndex]
 
-    # CLI selector — accepted anywhere before a mode is committed and only once.
-    # Typical placement is the very first positional arg (`c codex`, `c grok os`),
-    # but `c --dry-run codex` also works because flags are parsed in the same loop.
-    if ($currentArg -in "claude", "codex", "grok" -and -not $cliSet -and $mode -eq "docker") {
+    # --agent:<name> selector. Accepts full agent names only (claude, codex,
+    # grok, goose). This is how the ai-codex/ai-grok/ai-goose shortcuts pin the
+    # agent (`ai --agent=codex`, …). Wins over any later positional agent token
+    # (which is then treated as a CLI arg).
+    #
+    # Three spellings are accepted because `pwsh -File script --agent:x` SPLITS
+    # the token into `--agent` + `x` (a PowerShell -File quirk), while
+    # `--agent=x` stays intact:
+    #   --agent:<name>   (single token — direct invocation)
+    #   --agent=<name>   (single token — used by the .cmd shortcuts)
+    #   --agent <name>   (two tokens — the split form -File produces)
+    $agentValue = $null
+    if ($currentArg -match '^--agent[:=](.+)$') {
+        $agentValue = $Matches[1]
+        $argIndex++
+    } elseif ($currentArg -eq '--agent') {
+        if ($argIndex + 1 -ge $args.Count) {
+            Write-Error "--agent requires a value ($($ValidAgents -join '|'))"
+            exit 1
+        }
+        $agentValue = $args[$argIndex + 1]
+        $argIndex += 2
+    }
+    if ($agentValue) {
+        $requested = $agentValue.ToLower()
+        if ($requested -notin $ValidAgents) {
+            Write-Error "Unknown agent '$agentValue'. Valid: $($ValidAgents -join ', ')"
+            exit 1
+        }
+        $cli = $requested
+        $cliSet = $true
+        continue
+    }
+
+    # Positional agent selector — accepted anywhere before a mode is committed
+    # and only once. Typical placement is the very first positional arg
+    # (`ai codex`, `ai grok os`), but `ai --dry-run codex` also works because
+    # flags are parsed in the same loop. Skipped once --agent: has pinned one.
+    if ($currentArg -in $ValidAgents -and -not $cliSet -and $mode -eq "docker") {
         $cli = $currentArg
         $cliSet = $true
         $argIndex++
@@ -637,7 +720,7 @@ while ($argIndex -lt $args.Count) {
         continue
     }
 
-    # Not a c.ps1 command - stop parsing, rest goes to the selected CLI
+    # Not an ai.ps1 command - stop parsing, rest goes to the selected CLI
     break
 }
 
@@ -649,21 +732,29 @@ if ($argIndex -lt $args.Count) {
 # Resolve the CLI configuration once, so the os/wsl/docker handlers below can
 # stay agnostic of which CLI was picked.
 $cliCommand       = $CliConfig[$cli].Command
+$cliBaseArgs      = $CliConfig[$cli].BaseArgs
 $cliSandboxedArgs = $CliConfig[$cli].SandboxedArgs
+$cliSandboxedEnv  = $CliConfig[$cli].SandboxedEnv
 
-# Handle install: register c.ps1 globally (user PATH on Windows, shell alias on Unix)
+# Handle install: register ai.ps1 globally (user PATH on Windows, shell aliases on Unix)
 # and build the Docker image for AgentCli. Runs before project-root detection so it
 # works from any directory and doesn't require being inside a git repo.
 if ($mode -eq "install") {
-    Write-Host "Installing Claude launcher..." -ForegroundColor Cyan
+    Write-Host "Installing AgentCli launcher..." -ForegroundColor Cyan
     Write-Host "  Launcher dir: $scriptDir"
 
     $installOS = Get-CurrentOS
     Write-Host "  OS:           $installOS"
     Write-Host ""
 
+    # Entry-point shortcuts registered by install. 'ai' is the launcher itself;
+    # 'ai-codex'/'ai-grok'/'ai-goose' pin an agent via --agent: (see
+    # ai-codex.cmd / ai-grok.cmd / ai-goose.cmd).
+    $entryPoints = @("ai", "ai-codex", "ai-grok", "ai-goose")
+
     if ($installOS -eq "Windows") {
-        # Add launcher directory to the *user* PATH so `c` resolves in any new shell.
+        # Add launcher directory to the *user* PATH so the entry-point .cmd files
+        # resolve in any new shell.
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
         $existingParts = @($userPath -split ';' | Where-Object { $_ -and $_.Trim() })
         if ($existingParts -contains $scriptDir) {
@@ -675,43 +766,45 @@ if ($mode -eq "install") {
             Write-Host "(Open a new shell for the change to take effect.)" -ForegroundColor DarkGray
         }
     } else {
-        # macOS/Linux/WSL: pick the default shell's rc file and add (or refresh) an alias.
-        # Matches the convention from set-local-env.sh: zsh on macOS, bash everywhere else.
+        # macOS/Linux/WSL: pick the default shell's rc file and add (or refresh) an
+        # alias per entry point. zsh on macOS, bash everywhere else.
         $rcFile = switch ($installOS) {
             "macOS" { Join-Path $env:HOME ".zshrc" }
             default { Join-Path $env:HOME ".bashrc" }
         }
-        $cmdPath = Join-Path $scriptDir "c.cmd"
-        if (-not (Test-Path $cmdPath)) {
-            Write-Error "Expected launcher entry-point not found at: $cmdPath"
-            exit 1
-        }
-
-        # Polyglot c.cmd doubles as a bash script — must be executable for shell invocation.
-        & chmod +x $cmdPath 2>$null
-
-        $aliasLine    = "alias c='$cmdPath'"
-        $aliasPattern = '^\s*alias\s+c\s*='
-
         if (-not (Test-Path $rcFile)) {
             New-Item -ItemType File -Path $rcFile -Force | Out-Null
         }
-        $lines    = @(Get-Content -Path $rcFile -ErrorAction SilentlyContinue)
-        $existing = @($lines | Where-Object { $_ -match $aliasPattern })
 
-        if ($existing.Count -gt 0 -and $existing[0] -eq $aliasLine) {
-            Write-Host "Alias 'c' already set in $rcFile" -ForegroundColor DarkGray
-        } elseif ($existing.Count -gt 0) {
-            $updated = $lines | ForEach-Object {
-                if ($_ -match $aliasPattern) { $aliasLine } else { $_ }
+        foreach ($ep in $entryPoints) {
+            $cmdPath = Join-Path $scriptDir "$ep.cmd"
+            if (-not (Test-Path $cmdPath)) {
+                Write-Error "Expected launcher entry-point not found at: $cmdPath"
+                exit 1
             }
-            Set-Content -Path $rcFile -Value $updated
-            Write-Host "Updated alias 'c' in $rcFile" -ForegroundColor Green
-        } else {
-            Add-Content -Path $rcFile -Value $aliasLine
-            Write-Host "Added alias 'c' to $rcFile" -ForegroundColor Green
+            # Polyglot .cmd doubles as a bash script — must be executable for shell invocation.
+            & chmod +x $cmdPath 2>$null
+
+            $aliasLine    = "alias $ep='$cmdPath'"
+            $aliasPattern = "^\s*alias\s+$ep\s*="
+
+            $lines    = @(Get-Content -Path $rcFile -ErrorAction SilentlyContinue)
+            $existing = @($lines | Where-Object { $_ -match $aliasPattern })
+
+            if ($existing.Count -gt 0 -and $existing[0] -eq $aliasLine) {
+                Write-Host "Alias '$ep' already set in $rcFile" -ForegroundColor DarkGray
+            } elseif ($existing.Count -gt 0) {
+                $updated = $lines | ForEach-Object {
+                    if ($_ -match $aliasPattern) { $aliasLine } else { $_ }
+                }
+                Set-Content -Path $rcFile -Value $updated
+                Write-Host "Updated alias '$ep' in $rcFile" -ForegroundColor Green
+            } else {
+                Add-Content -Path $rcFile -Value $aliasLine
+                Write-Host "Added alias '$ep' to $rcFile" -ForegroundColor Green
+            }
         }
-        Write-Host "(Run 'source $rcFile' or open a new shell for the alias to take effect.)" -ForegroundColor DarkGray
+        Write-Host "(Run 'source $rcFile' or open a new shell for the aliases to take effect.)" -ForegroundColor DarkGray
     }
 
     # Link AgentCli's .claude/{commands,skills} into the user's global Claude
@@ -740,7 +833,7 @@ if ($mode -eq "install") {
         exit 0
     }
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-        Write-Host "docker not found in PATH — skipping build. Install Docker and re-run 'c install' or 'c build'." -ForegroundColor Yellow
+        Write-Host "docker not found in PATH — skipping build. Install Docker and re-run 'ai install' or 'ai build'." -ForegroundColor Yellow
         exit 0
     }
 
@@ -758,17 +851,19 @@ if ($mode -eq "install") {
     exit 0
 }
 
-# Handle uninstall: undo everything `c install` did — unregister `c` from PATH/
-# shell alias, remove the team links under ~/.claude/{commands,skills}, stop the
-# AgentCli docker-compose stack, and remove the shared AgentCli Docker image.
+# Handle uninstall: undo everything `ai install` did — unregister `ai`/`c`/`g`
+# from PATH/shell aliases, remove the team links under ~/.claude/{commands,skills},
+# stop the AgentCli docker-compose stack, and remove the shared AgentCli Docker image.
 # Per-project Docker containers and AGENTS.md/CLAUDE.md outputs are left alone.
 if ($mode -eq "uninstall") {
-    Write-Host "Uninstalling Claude launcher..." -ForegroundColor Cyan
+    Write-Host "Uninstalling AgentCli launcher..." -ForegroundColor Cyan
     Write-Host "  Launcher dir: $scriptDir"
 
     $installOS = Get-CurrentOS
     Write-Host "  OS:           $installOS"
     Write-Host ""
+
+    $entryPoints = @("ai", "ai-codex", "ai-grok", "ai-goose")
 
     if ($installOS -eq "Windows") {
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -786,18 +881,20 @@ if ($mode -eq "uninstall") {
             "macOS" { Join-Path $env:HOME ".zshrc" }
             default { Join-Path $env:HOME ".bashrc" }
         }
-        $aliasPattern = '^\s*alias\s+c\s*='
 
         if (-not (Test-Path $rcFile)) {
             Write-Host "No $rcFile to update." -ForegroundColor DarkGray
         } else {
-            $lines    = @(Get-Content -Path $rcFile -ErrorAction SilentlyContinue)
-            $filtered = @($lines | Where-Object { $_ -notmatch $aliasPattern })
-            if ($filtered.Count -eq $lines.Count) {
-                Write-Host "No 'c' alias found in $rcFile" -ForegroundColor DarkGray
-            } else {
-                Set-Content -Path $rcFile -Value $filtered
-                Write-Host "Removed alias 'c' from $rcFile" -ForegroundColor Green
+            foreach ($ep in $entryPoints) {
+                $aliasPattern = "^\s*alias\s+$ep\s*="
+                $lines    = @(Get-Content -Path $rcFile -ErrorAction SilentlyContinue)
+                $filtered = @($lines | Where-Object { $_ -notmatch $aliasPattern })
+                if ($filtered.Count -eq $lines.Count) {
+                    Write-Host "No '$ep' alias found in $rcFile" -ForegroundColor DarkGray
+                } else {
+                    Set-Content -Path $rcFile -Value $filtered
+                    Write-Host "Removed alias '$ep' from $rcFile" -ForegroundColor Green
+                }
             }
         }
     }
@@ -853,7 +950,7 @@ if ($mode -eq "uninstall") {
 
 # Handle update-md: regenerate byte-identical AGENTS.md and CLAUDE.md by
 # concatenating two sources:
-#   1. AGENTS-Source.md from the project where c.ps1 was launched ((Get-Location).Path) —
+#   1. AGENTS-Source.md from the project where ai.ps1 was launched ((Get-Location).Path) —
 #      optional, holds the project-specific local part.
 #   2. AGENTS-Suffix.md from the AgentCli repo ($scriptDir) — required, the shared
 #      boilerplate appended to every project's generated docs.
@@ -882,7 +979,7 @@ if ($mode -eq "update-md") {
     $partNames.Add("AGENTS-Suffix.md (AgentCli)")
 
     $sourceDesc = $partNames -join " + "
-    $header = "<!-- AUTO-GENERATED — DO NOT EDIT. Built by ``c update-md`` from $sourceDesc. To change anything below, edit the source file(s) and re-run ``c update-md``. -->"
+    $header = "<!-- AUTO-GENERATED — DO NOT EDIT. Built by ``ai update-md`` from $sourceDesc. To change anything below, edit the source file(s) and re-run ``ai update-md``. -->"
     $content = $header + "`n`n" + (($parts -join "`n`n")) + "`n"
 
     foreach ($outName in @("AGENTS.md", "CLAUDE.md")) {
@@ -941,7 +1038,7 @@ if ($debugMode -and $isOutOfTree) {
 }
 
 # AgentCli's own folder name (leaf of $scriptDir). Used to locate this script
-# inside Docker (/proj/<name>/c.ps1) and to derive the shared image name.
+# inside Docker (/proj/<name>/ai.ps1) and to derive the shared image name.
 $agentCliFolderName = Split-Path -Leaf $scriptDir
 if (-not (Test-IsUnderRoot $scriptDir $env:AC_ProjectRoot)) {
     Write-Error "AgentCli ($scriptDir) is not under AC_ProjectRoot ($env:AC_ProjectRoot). Set AC_ProjectRoot to a folder that contains AgentCli, or leave it unset to default to AgentCli's parent."
@@ -2031,17 +2128,32 @@ switch ($mode) {
         # Convert paths for WSL
         $wslProjectRoot = ConvertTo-WSLPath $env:AC_ProjectRoot
         $wslWorkDir = "/mnt/" + ((Get-Location).ToString().Substring(0, 1).ToLower()) + ((Get-Location).ToString().Substring(2) -replace "\\", "/")
-        # Always re-invoke AgentCli's c.ps1 (consumer projects no longer carry a copy).
-        $wslScriptPath = (ConvertTo-WSLPath $scriptDir) + "/c.ps1"
+        # Always re-invoke AgentCli's ai.ps1 (consumer projects no longer carry a copy).
+        $wslScriptPath = (ConvertTo-WSLPath $scriptDir) + "/ai.ps1"
 
         Write-Host "Working Directory: $wslWorkDir @ $wslProjectRoot"
 
-        # Build args for the script running in WSL. The CLI selector is prepended so
-        # the inner pwsh c.ps1 invocation parses it back into $cli.
+        # Build args for the script running in WSL. The agent selector is prepended so
+        # the inner pwsh ai.ps1 invocation parses it back into $cli.
         $wslArgs = @($cli, "os", "from-wsl")
         if ($dryRun) { $wslArgs += "--dry-run" }
         if ($debugMode) { $wslArgs += "--debug" }
         $wslArgs += $cliArgs
+
+        # Goose reads ~/.config/goose/config.yaml inside WSL. Copy the host goose
+        # config into the WSL user's home before launch so the LM Studio / provider
+        # setup carries over. Best-effort — skipped if the host has no goose config.
+        $wslGoosePrefix = ""
+        if ($cli -eq "goose") {
+            $gooseConfigDir = Get-GooseConfigDir
+            if ($gooseConfigDir) {
+                $wslGooseSrc = ConvertTo-WSLPath (Join-Path $gooseConfigDir "config.yaml")
+                $wslGoosePrefix = "mkdir -p ~/.config/goose && cp -f '$wslGooseSrc' ~/.config/goose/config.yaml 2>/dev/null; "
+                Write-Host "Goose config: copying $gooseConfigDir/config.yaml into WSL ~/.config/goose/" -ForegroundColor DarkGray
+            } else {
+                Write-Host "Goose config: none found on host — WSL goose will use its own config." -ForegroundColor DarkGray
+            }
+        }
 
         # Collect propagated env vars for WSL (same rules as Docker)
         $wslPropagatedParts = @()
@@ -2066,7 +2178,7 @@ switch ($mode) {
         $wslPropagatedString = $wslPropagatedParts -join ' '
         $wslEnvString = ("$wslPropagatedString AC_ProjectRoot='$wslProjectRoot' DISABLE_AUTOUPDATER=1 AC_ProjectPath='$wslProjectPath' AC_Worktree='$worktree'").Trim()
 
-        $wslCommandFull = "cd '$wslWorkDir' && export $wslEnvString && pwsh '$wslScriptPath' $($wslArgs -join ' ')"
+        $wslCommandFull = "$wslGoosePrefix" + "cd '$wslWorkDir' && export $wslEnvString && pwsh '$wslScriptPath' $($wslArgs -join ' ')"
 
         $wslEnvVars = @{
             "AC_ProjectRoot" = $wslProjectRoot
@@ -2085,7 +2197,7 @@ switch ($mode) {
             }
             Write-Host ""
             Write-Host "Command:" -ForegroundColor Cyan
-            $cmdLine = ("$cliCommand " + ($cliArgs -join ' ')).Trim()
+            $cmdLine = ("$cliCommand " + ((@($cliBaseArgs) + $cliArgs) -join ' ')).Trim()
             Write-Host "  $cmdLine"
             Write-Host ""
             Write-Host "WSL launch command:" -ForegroundColor Cyan
@@ -2129,11 +2241,22 @@ switch ($mode) {
             $envVars["CLAUDE_CODE_USE_POWERSHELL_TOOL"] = "1"
         }
 
+        # Apply the agent's sandbox-only env vars inside Docker (e.g. goose
+        # GOOSE_MODE=auto, which is how goose skips per-tool approvals — it has
+        # no equivalent CLI flag). Never applied on the host OS.
+        if ($currentOS -eq "Docker" -and $cliSandboxedEnv) {
+            foreach ($k in $cliSandboxedEnv.Keys) {
+                Set-Item -Path "env:$k" -Value $cliSandboxedEnv[$k]
+                $envVars[$k] = $cliSandboxedEnv[$k]
+            }
+        }
+
         if ($dryRun) {
+            # BaseArgs (e.g. `goose session`) always precede; SandboxedArgs only in Docker.
             $allArgs = if ($currentOS -eq "Docker") {
-                @($cliSandboxedArgs) + $cliArgs
+                @($cliBaseArgs) + @($cliSandboxedArgs) + $cliArgs
             } else {
-                $cliArgs
+                @($cliBaseArgs) + $cliArgs
             }
             Show-DryRun -EnvVars $envVars -Command $cliCommand -Arguments $allArgs -ModeName $env:AC_OS
         } else {
@@ -2148,7 +2271,7 @@ switch ($mode) {
                     & chmod 700 $sshDir
                     & sh -c "chmod 600 $sshDir/* 2>/dev/null; chmod 644 $sshDir/*.pub $sshDir/known_hosts $sshDir/config 2>/dev/null; true"
                 }
-                $allArgs = @($cliSandboxedArgs) + $cliArgs
+                $allArgs = @($cliBaseArgs) + @($cliSandboxedArgs) + $cliArgs
                 & $cliCommand @allArgs
                 if ($debugMode) {
                     Write-Host ""
@@ -2156,11 +2279,12 @@ switch ($mode) {
                 }
             } elseif ($currentOS -eq "WSL") {
                 # In WSL, use bash -i so the interactive shell sources .bashrc and picks up the npm PATH
-                $cmdLine = ("$cliCommand " + ($cliArgs -join ' ')).Trim()
+                $cmdLine = ("$cliCommand " + ((@($cliBaseArgs) + $cliArgs) -join ' ')).Trim()
                 & bash -i -c $cmdLine
             } else {
                 # Windows/Linux/macOS - already in wt on Windows (handled at script start)
-                & $cliCommand @cliArgs
+                $allArgs = @($cliBaseArgs) + $cliArgs
+                & $cliCommand @allArgs
             }
         }
     }
@@ -2231,7 +2355,7 @@ switch ($mode) {
         }
 
         # Claude config mounts. The host's ~/.claude/{commands,skills}/team links
-        # (created by `c install`) come through this parent mount. On Windows the
+        # (created by `ai install`) come through this parent mount. On Windows the
         # links are NTFS junctions, which Docker Desktop resolves transparently —
         # so AgentCli's shared commands/skills are visible without an extra mount.
         # On Linux/macOS/WSL the links are POSIX symlinks whose target is a host
@@ -2301,6 +2425,20 @@ switch ($mode) {
             $volumeMounts += New-VolumeMount $actualPath "/home/claude/.actual" -ReadOnly
         }
 
+        # Goose config mount (only when the goose agent is selected). Goose in the
+        # container reads ~/.config/goose/config.yaml; the host folder that DIRECTLY
+        # holds config.yaml is OS-specific (%APPDATA%\Block\goose\config on Windows,
+        # ~/.config/goose elsewhere), so it maps 1:1 onto the container path.
+        # Read-only — the container's LM Studio / provider setup carries over. With
+        # --network host, the config's localhost:1234 LM Studio endpoint reaches the
+        # host directly.
+        if ($cli -eq "goose") {
+            $gooseConfigDir = Get-GooseConfigDir
+            if ($gooseConfigDir) {
+                $volumeMounts += New-VolumeMount $gooseConfigDir "/home/claude/.config/goose" -ReadOnly
+            }
+        }
+
         # Calculate Docker working directory
         $dockerWorkDir     = "$dockerProjectPath$relativePath"
         # All projects now share the AgentCli Docker image — no per-project Dockerfile.
@@ -2316,16 +2454,16 @@ switch ($mode) {
             $projectName.ToLower()
         }
         $containerName     = "$containerBaseName-$(Get-Date -Format 'MMdd-HHmmss')"
-        # Always re-invoke AgentCli's c.ps1 (consumer projects no longer carry a copy).
-        $dockerScriptPath = "/proj/$agentCliFolderName/c.ps1"
+        # Always re-invoke AgentCli's ai.ps1 (consumer projects no longer carry a copy).
+        $dockerScriptPath = "/proj/$agentCliFolderName/ai.ps1"
 
         if ($dryRun) {
             Write-Host "Container: $containerName"
             Write-Host "Working Directory: $dockerWorkDir @ /proj"
         }
 
-        # Build args for the script running in Docker. The CLI selector is prepended
-        # so the inner pwsh c.ps1 parses it back into $cli and runs the right binary.
+        # Build args for the script running in Docker. The agent selector is prepended
+        # so the inner pwsh ai.ps1 parses it back into $cli and runs the right binary.
         $dockerScriptArgs = @($cli, "os", "from-docker")
         if ($dryRun) { $dockerScriptArgs += "--dry-run" }
         if ($debugMode) { $dockerScriptArgs += "--debug" }
@@ -2453,7 +2591,7 @@ switch ($mode) {
             }
             Write-Host ""
             Write-Host "Command:" -ForegroundColor Cyan
-            $dryCmd = ("$cliCommand " + (@($cliSandboxedArgs + $cliArgs) -join ' ')).Trim()
+            $dryCmd = ("$cliCommand " + ((@($cliBaseArgs) + @($cliSandboxedArgs) + $cliArgs) -join ' ')).Trim()
             Write-Host "  $dryCmd"
             Write-Host ""
             Write-Host "Docker launch command:" -ForegroundColor Cyan
