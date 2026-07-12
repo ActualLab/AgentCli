@@ -1,6 +1,6 @@
 # AgentCli sandbox environment for ActualLab projects
 # Supports: ActualLab.Fusion, ActualLab.Fusion.Samples, ActualChat
-# Includes: .NET 10 SDK, .NET 9 SDK, Node.js 20, Claude Code + Codex + Grok + Goose CLIs
+# Includes: .NET 10 SDK, .NET 9 SDK, Node.js 20, Claude Code + Codex + Grok + Goose + OpenCode CLIs
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0.202
 
@@ -125,6 +125,9 @@ RUN curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.201
 
 # Install OpenAI Codex CLI (npm global, lands in /usr/local/share/npm-global/bin)
 RUN npm install -g @openai/codex
+
+# Install OpenCode CLI (sst/opencode; npm global, lands in /usr/local/share/npm-global/bin)
+RUN npm install -g opencode-ai
 
 # Install Grok CLI from x.ai. The installer writes to $HOME/.local/bin, which is
 # already first on PATH for this user (see the ENV PATH= line above).

@@ -11,11 +11,11 @@ when `ai update-md` regenerates `AGENTS.md` / `CLAUDE.md`.
 `ai.ps1` works from any current directory and operates on whatever folder
 it was started in — the launched CLI session targets the caller's working
 directory, not AgentCli's. The Docker image (`claude-agentcli`) bundles
-Claude Code, OpenAI Codex, xAI Grok, and Codename Goose side by side;
+Claude Code, OpenAI Codex, xAI Grok, Codename Goose, and OpenCode side by side;
 `ai.ps1` picks which one to run via its first positional arg or the
-`--agent:` option (`ai claude` / `ai codex` / `ai grok` / `ai goose`,
-default `claude`). `ai-codex` / `ai-grok` / `ai-goose` are one-agent shortcuts
-(`= ai --agent:<name>`).
+`--agent:` option (`ai claude` / `ai codex` / `ai grok` / `ai goose` /
+`ai opencode`, default `claude`). `ai-codex` / `ai-grok` / `ai-goose` /
+`ai-opencode` are one-agent shortcuts (`= ai --agent:<name>`).
 
 ## Status
 
@@ -26,9 +26,9 @@ all launcher-related files; consumer projects never carry a copy.
 
 In scope:
 - `ai.ps1` and its PowerShell helpers (`scripts/`); the `ai.cmd` /
-  `ai-codex.cmd` / `ai-grok.cmd` / `ai-goose.cmd` entry points
+  `ai-codex.cmd` / `ai-grok.cmd` / `ai-goose.cmd` / `ai-opencode.cmd` entry points
 - `Dockerfile` — the **single shared** Docker image used by every
-  project (Claude + Codex + Grok + Goose CLIs all pre-installed)
+  project (Claude + Codex + Grok + Goose + OpenCode CLIs all pre-installed)
 - WSL and direct-on-host launch paths
 - Worktree detection (`AC_Worktree`, `ai wt …`)
 - Out-of-tree launch support (sanitized `/proj/<path>` mount + extra

@@ -13,11 +13,11 @@ when `ai update-md` regenerates `AGENTS.md` / `CLAUDE.md`.
 `ai.ps1` works from any current directory and operates on whatever folder
 it was started in — the launched CLI session targets the caller's working
 directory, not AgentCli's. The Docker image (`claude-agentcli`) bundles
-Claude Code, OpenAI Codex, xAI Grok, and Codename Goose side by side;
+Claude Code, OpenAI Codex, xAI Grok, Codename Goose, and OpenCode side by side;
 `ai.ps1` picks which one to run via its first positional arg or the
-`--agent:` option (`ai claude` / `ai codex` / `ai grok` / `ai goose`,
-default `claude`). `ai-codex` / `ai-grok` / `ai-goose` are one-agent shortcuts
-(`= ai --agent:<name>`).
+`--agent:` option (`ai claude` / `ai codex` / `ai grok` / `ai goose` /
+`ai opencode`, default `claude`). `ai-codex` / `ai-grok` / `ai-goose` /
+`ai-opencode` are one-agent shortcuts (`= ai --agent:<name>`).
 
 ## Status
 
@@ -28,9 +28,9 @@ all launcher-related files; consumer projects never carry a copy.
 
 In scope:
 - `ai.ps1` and its PowerShell helpers (`scripts/`); the `ai.cmd` /
-  `ai-codex.cmd` / `ai-grok.cmd` / `ai-goose.cmd` entry points
+  `ai-codex.cmd` / `ai-grok.cmd` / `ai-goose.cmd` / `ai-opencode.cmd` entry points
 - `Dockerfile` — the **single shared** Docker image used by every
-  project (Claude + Codex + Grok + Goose CLIs all pre-installed)
+  project (Claude + Codex + Grok + Goose + OpenCode CLIs all pre-installed)
 - WSL and direct-on-host launch paths
 - Worktree detection (`AC_Worktree`, `ai wt …`)
 - Out-of-tree launch support (sanitized `/proj/<path>` mount + extra
@@ -157,6 +157,7 @@ following agents in a chosen environment:
 - **OpenAI Codex** — `codex`
 - **xAI Grok** — `grok`
 - **Codename Goose** — `goose` (block/goose)
+- **OpenCode** — `opencode` (sst/opencode)
 
 …in any of the following environments:
 
@@ -172,34 +173,36 @@ running and how to access projects.
 
 The agent is the optional first positional arg (or the `--agent:<name>`
 option); if omitted, `claude` is used. `--agent:` accepts the full agent names
-only (`claude`, `codex`, `grok`, `goose`). Entry points:
+only (`claude`, `codex`, `grok`, `goose`, `opencode`). Entry points:
 
 - `ai` — the launcher itself; Claude by default, or pick the agent explicitly.
-- `ai-codex` / `ai-grok` / `ai-goose` — one-agent shortcuts (`= ai --agent:<name>`).
+- `ai-codex` / `ai-grok` / `ai-goose` / `ai-opencode` — one-agent shortcuts (`= ai --agent:<name>`).
 
 ```
-ai                 → claude, Docker (default)
-ai codex           → codex,  Docker (positional form)
-ai-codex           → codex,  Docker (= ai --agent:codex)
-ai-grok os         → grok,   host OS
-ai-goose           → goose,  Docker (= ai --agent:goose)
-ai --agent:goose   → goose,  Docker (explicit)
-ai wsl             → claude, WSL
-ai os              → claude, host OS  (default agent)
-ai codex --dry-run → codex,  Docker (dry run)
+ai                 → claude,   Docker (default)
+ai codex           → codex,    Docker (positional form)
+ai-codex           → codex,    Docker (= ai --agent:codex)
+ai-grok os         → grok,     host OS
+ai-goose           → goose,    Docker (= ai --agent:goose)
+ai --agent:goose   → goose,    Docker (explicit)
+ai-opencode        → opencode, Docker (= ai --agent:opencode)
+ai opencode wsl    → opencode, WSL
+ai wsl             → claude,   WSL
+ai os              → claude,   host OS  (default agent)
+ai codex --dry-run → codex,    Docker (dry run)
 ```
 
 Inside the sandboxed Docker container, each agent is invoked in its
 "skip-approvals" mode (`claude --dangerously-skip-permissions`, `codex
---full-auto`, `grok` as-is, `goose session` with `GOOSE_MODE=auto`). On the
-host OS no such flag/mode is added — the agent runs in its normal
-interactive/approval mode.
+--full-auto`, `grok` as-is, `goose session` with `GOOSE_MODE=auto`,
+`opencode --auto`). On the host OS no such flag/mode is added — the agent runs
+in its normal interactive/approval mode.
 
 ## Installation
 
 Run once after cloning AgentCli to make the `ai` / `ai-codex` / `ai-grok` /
-`ai-goose` commands available everywhere and build the Docker image (which
-contains all four CLIs pre-installed):
+`ai-goose` / `ai-opencode` commands available everywhere and build the Docker
+image (which contains all five CLIs pre-installed):
 
 ```
 ./ai.ps1 install
@@ -209,8 +212,8 @@ What `install` does, by host OS:
 - **Windows** — adds the AgentCli folder to the *user* `Path` environment
   variable so the entry-point `.cmd` files resolve in any new shell.
 - **macOS** — adds `alias ai=…`, `alias ai-codex=…`, `alias ai-grok=…`,
-  `alias ai-goose=…` (pointing at the polyglot `.cmd` files) to `~/.zshrc` and
-  `chmod +x`'s them.
+  `alias ai-goose=…`, `alias ai-opencode=…` (pointing at the polyglot `.cmd`
+  files) to `~/.zshrc` and `chmod +x`'s them.
 - **Linux / WSL** — same as macOS, but the aliases go into `~/.bashrc`.
 
 After the PATH/alias step, `install` also links AgentCli's shared
@@ -276,7 +279,7 @@ When running in Docker (`AC_OS` = `Linux in Docker`), the following tools are av
 
 | Category | Tools |
 |----------|-------|
-| **AI CLIs** | Claude Code, OpenAI Codex, xAI Grok, Codename Goose |
+| **AI CLIs** | Claude Code, OpenAI Codex, xAI Grok, Codename Goose, OpenCode |
 | **.NET** | .NET 10 SDK, .NET 9 SDK, wasm-tools workload |
 | **Node.js** | Node.js 20, npm |
 | **Shell** | Zsh (default), Bash, PowerShell (`pwsh`) |
@@ -293,9 +296,11 @@ When running in Docker, `/proj/<CurrentProject>/artifacts` path is mapped to `ar
 
 **Host service connectivity**: The Docker container uses `--network host` mode. On **native Linux** this makes `localhost` inside the container refer to the host directly, so you reach host services (Redis, PostgreSQL, NATS, etc.) at `localhost:port`. On **Docker Desktop (Windows/macOS)** `--network host` attaches the container to the Linux VM's network namespace, **not** the host — so `localhost:port` hits the VM, and host services must be reached via `host.docker.internal:port` (and the host service must bind `0.0.0.0`, not just loopback). On macOS, `--network host` requires Docker Desktop 4.34+ (Sept 2024).
 
-**macOS / Apple Silicon**: The Docker image supports both amd64 and arm64 architectures. `ai.cmd` (and the `ai-codex.cmd` / `ai-grok.cmd` / `ai-goose.cmd` shortcuts) are polyglot scripts that work on both Windows and macOS/Linux.
+**macOS / Apple Silicon**: The Docker image supports both amd64 and arm64 architectures. `ai.cmd` (and the `ai-codex.cmd` / `ai-grok.cmd` / `ai-goose.cmd` / `ai-opencode.cmd` shortcuts) are polyglot scripts that work on both Windows and macOS/Linux.
 
 **Goose config**: When you launch the `goose` agent, the launcher passes your host goose config to the sandboxed/WSL goose so its provider setup (e.g. a local LM Studio endpoint) carries over. In Docker the host goose config dir (`%APPDATA%\Block\goose\config` on Windows, `~/.config/goose` elsewhere) is bind-mounted read-only to `/home/claude/.config/goose`; in WSL the `config.yaml` is copied into the WSL user's `~/.config/goose/`. A `localhost:1234` LM Studio endpoint in that config works unchanged: on native-Linux Docker `--network host` already makes localhost the host; on Docker Desktop (Windows/macOS) the launcher starts an in-container `socat` forwarder so `localhost:1234` reaches `host.docker.internal:1234` (override the port with `AC_LMSTUDIO_PORT`; LM Studio must serve on `0.0.0.0`). In WSL, use mirrored networking mode (`.wslconfig` → `networkingMode=mirrored`) so `localhost` is shared with Windows.
+
+**OpenCode config**: When you launch the `opencode` agent, the launcher passes your host OpenCode config (`~/.config/opencode/opencode.json(c)`) to the sandboxed/WSL opencode so its provider setup carries over. In Docker the host `~/.config/opencode` dir is bind-mounted read-only to `/home/claude/.config/opencode`; in WSL the `opencode.json(c)` is copied into the WSL user's `~/.config/opencode/`. Just like Goose, a `localhost:1234` LM Studio endpoint in that config is made reachable by the same in-container `socat` forwarder on Docker Desktop (and by mirrored WSL networking) — see the Goose note above. In the sandbox opencode runs with `--auto` (auto-approve).
 
 **Propagated environment variables**: The following environment variables are automatically propagated from the host to the Docker container:
 - Variables containing `__` in their names (e.g., `ChatSettings__OpenAIApiKey` for .NET configuration)

@@ -1,5 +1,5 @@
 #!/usr/bin/env pwsh
-# AgentCli launcher script - runs Claude / Codex / Grok / Goose in Docker, WSL, or native OS
+# AgentCli launcher script - runs Claude / Codex / Grok / Goose / OpenCode in Docker, WSL, or native OS
 
 # Auto-detect AC_ProjectRoot from the folder containing this script
 # e.g., if ai.ps1 is at D:\Projects\ActualChat\ai.ps1, AC_ProjectRoot = D:\Projects
@@ -65,6 +65,17 @@ function Get-GooseConfigDir {
         default   { Join-Path $env:HOME ".config/goose" }
     }
     if (Test-Path (Join-Path $dir "config.yaml")) { return $dir }
+    return $null
+}
+
+# Returns the host directory that DIRECTLY contains opencode's config
+# (opencode.jsonc / opencode.json), or $null if none exists. opencode uses
+# ~/.config/opencode on every OS (XDG-style, incl. Windows), so the folder maps
+# 1:1 onto ~/.config/opencode inside WSL/Docker.
+function Get-OpenCodeConfigDir {
+    $ocHome = if ((Get-CurrentOS) -eq "Windows") { $env:USERPROFILE } else { $env:HOME }
+    $dir = Join-Path $ocHome ".config/opencode"
+    if ((Test-Path (Join-Path $dir "opencode.jsonc")) -or (Test-Path (Join-Path $dir "opencode.json"))) { return $dir }
     return $null
 }
 
@@ -379,7 +390,7 @@ function Find-ProjectRoot {
 
 # Main logic
 $currentOS             = Get-CurrentOS
-$cli                   = "claude" # default CLI/agent (claude | codex | grok | goose)
+$cli                   = "claude" # default CLI/agent (claude | codex | grok | goose | opencode)
 $mode                  = "docker"  # default mode
 $fromMode              = $null     # set when self-invoked (e.g., from-docker, from-wsl)
 $worktreeSuffix        = $null     # set when wt argument is used
@@ -428,16 +439,22 @@ $CliConfig = @{
             "GOOSE_DISABLE_KEYRING" = "1"            # no OS keyring in a headless container; use the config file
         }
     }
+    "opencode" = @{
+        Command       = "opencode"
+        BaseArgs      = @()                          # default command launches the TUI
+        SandboxedArgs = @("--auto")                  # auto-approve permissions in the sandbox
+        SandboxedEnv  = @{}
+    }
 }
 
 # Valid agent names — accepted both as the positional selector (`ai codex`) and
 # as the --agent value (`ai --agent:codex`). The ai-codex/ai-grok/ai-goose
 # entry-point shortcuts (ai-codex.cmd/…) each pin one via `ai --agent=<name>`.
-$ValidAgents = @("claude", "codex", "grok", "goose")
+$ValidAgents = @("claude", "codex", "grok", "goose", "opencode")
 
 # Show help
 function Show-Help {
-    Write-Host "AgentCli Launcher - Run Claude / Codex / Grok / Goose in Docker, WSL, or native OS" -ForegroundColor Cyan
+    Write-Host "AgentCli Launcher - Run Claude / Codex / Grok / Goose / OpenCode in Docker, WSL, or native OS" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Usage: ai [agent] [command] [options] [cli-args]" -ForegroundColor Yellow
     Write-Host ""
@@ -446,13 +463,15 @@ function Show-Help {
     Write-Host "  codex        OpenAI Codex"
     Write-Host "  grok         xAI Grok"
     Write-Host "  goose        Codename Goose (block/goose)"
+    Write-Host "  opencode     OpenCode (sst/opencode)"
     Write-Host ""
     Write-Host "Entry points / shortcuts:"
     Write-Host "  ai           This launcher (Claude by default; pick agent via positional arg or --agent:)"
     Write-Host "  ai-codex     Shortcut for 'ai --agent:codex'"
     Write-Host "  ai-grok      Shortcut for 'ai --agent:grok'"
     Write-Host "  ai-goose     Shortcut for 'ai --agent:goose'"
-    Write-Host "  --agent:<n>  Select agent (claude|codex|grok|goose)"
+    Write-Host "  ai-opencode  Shortcut for 'ai --agent:opencode'"
+    Write-Host "  --agent:<n>  Select agent (claude|codex|grok|goose|opencode)"
     Write-Host ""
     Write-Host "Commands:"
     Write-Host "  (default)    Run selected CLI in Docker container"
@@ -464,7 +483,7 @@ function Show-Help {
     Write-Host "  rwt <suffix> Remove worktree and clean up (ports, hosts, nginx config)"
     Write-Host "  chrome       Start Chrome with remote debugging enabled (for Playwright)"
     Write-Host "  build        Build the shared AgentCli Docker image (claude-<agentcli folder>)"
-    Write-Host "  install      Register 'ai'/'ai-codex'/'ai-grok'/'ai-goose' globally (user PATH on Windows, shell aliases on Unix) and build Docker image"
+    Write-Host "  install      Register 'ai'/'ai-codex'/'ai-grok'/'ai-goose'/'ai-opencode' globally (user PATH on Windows, shell aliases on Unix) and build Docker image"
     Write-Host "  uninstall    Reverse 'install': unregister those entry points, remove team links, remove the AgentCli Docker image"
     Write-Host "  compose-start Start the AgentCli docker-compose stack (chrome-devtools-mcp, etc.) — auto-runs once per OS boot"
     Write-Host "  update-md    Regenerate AGENTS.md/CLAUDE.md in cwd from AGENTS-Source.md (cwd) + AGENTS-Suffix.md (AgentCli)"
@@ -502,6 +521,7 @@ function Show-Help {
     Write-Host "  ai-codex           Shortcut: Codex in Docker (= ai --agent:codex)"
     Write-Host "  ai-grok            Shortcut: Grok in Docker (= ai --agent:grok)"
     Write-Host "  ai-goose           Shortcut: Goose in Docker (= ai --agent:goose)"
+    Write-Host "  ai-opencode        Shortcut: OpenCode in Docker (= ai --agent:opencode)"
     Write-Host "  ai goose           Run Goose in Docker (positional form)"
     Write-Host "  ai --agent:goose   Select Goose explicitly"
     Write-Host "  ai --dry-run       Show what Docker would run"
@@ -528,7 +548,7 @@ function Show-Help {
     Write-Host "  ai edge[:PORT][*N] Same as chrome, for Microsoft Edge (default port 9322)"
     Write-Host "  ai audio           Setup/start PulseAudio for voice mode (macOS only)"
     Write-Host "  ai build           Build Docker image"
-    Write-Host "  ai install         Register 'ai'/'ai-codex'/'ai-grok'/'ai-goose' globally and build the Docker image (run once after cloning AgentCli)"
+    Write-Host "  ai install         Register 'ai'/'ai-codex'/'ai-grok'/'ai-goose'/'ai-opencode' globally and build the Docker image (run once after cloning AgentCli)"
     Write-Host "  ai --resume abc    Pass --resume abc to the selected agent"
     Write-Host ""
 }
@@ -542,7 +562,7 @@ while ($argIndex -lt $args.Count) {
     $currentArg = $args[$argIndex]
 
     # --agent:<name> selector. Accepts full agent names only (claude, codex,
-    # grok, goose). This is how the ai-codex/ai-grok/ai-goose shortcuts pin the
+    # grok, goose, opencode). This is how the ai-codex/…/ai-opencode shortcuts pin the
     # agent (`ai --agent=codex`, …). Wins over any later positional agent token
     # (which is then treated as a CLI arg).
     #
@@ -748,9 +768,9 @@ if ($mode -eq "install") {
     Write-Host ""
 
     # Entry-point shortcuts registered by install. 'ai' is the launcher itself;
-    # 'ai-codex'/'ai-grok'/'ai-goose' pin an agent via --agent: (see
-    # ai-codex.cmd / ai-grok.cmd / ai-goose.cmd).
-    $entryPoints = @("ai", "ai-codex", "ai-grok", "ai-goose")
+    # 'ai-codex'/'ai-grok'/'ai-goose'/'ai-opencode' pin an agent via --agent: (see
+    # ai-codex.cmd / ai-grok.cmd / ai-goose.cmd / ai-opencode.cmd).
+    $entryPoints = @("ai", "ai-codex", "ai-grok", "ai-goose", "ai-opencode")
 
     if ($installOS -eq "Windows") {
         # Add launcher directory to the *user* PATH so the entry-point .cmd files
@@ -863,7 +883,7 @@ if ($mode -eq "uninstall") {
     Write-Host "  OS:           $installOS"
     Write-Host ""
 
-    $entryPoints = @("ai", "ai-codex", "ai-grok", "ai-goose")
+    $entryPoints = @("ai", "ai-codex", "ai-grok", "ai-goose", "ai-opencode")
 
     if ($installOS -eq "Windows") {
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -2140,18 +2160,28 @@ switch ($mode) {
         if ($debugMode) { $wslArgs += "--debug" }
         $wslArgs += $cliArgs
 
-        # Goose reads ~/.config/goose/config.yaml inside WSL. Copy the host goose
-        # config into the WSL user's home before launch so the LM Studio / provider
-        # setup carries over. Best-effort — skipped if the host has no goose config.
-        $wslGoosePrefix = ""
+        # Copy the selected agent's host config into the WSL user's home before
+        # launch so its provider setup (e.g. a local LM Studio endpoint) carries
+        # over. Best-effort — skipped if the host has no such config.
+        $wslConfigPrefix = ""
         if ($cli -eq "goose") {
             $gooseConfigDir = Get-GooseConfigDir
             if ($gooseConfigDir) {
                 $wslGooseSrc = ConvertTo-WSLPath (Join-Path $gooseConfigDir "config.yaml")
-                $wslGoosePrefix = "mkdir -p ~/.config/goose && cp -f '$wslGooseSrc' ~/.config/goose/config.yaml 2>/dev/null; "
+                $wslConfigPrefix = "mkdir -p ~/.config/goose && cp -f '$wslGooseSrc' ~/.config/goose/config.yaml 2>/dev/null; "
                 Write-Host "Goose config: copying $gooseConfigDir/config.yaml into WSL ~/.config/goose/" -ForegroundColor DarkGray
             } else {
                 Write-Host "Goose config: none found on host — WSL goose will use its own config." -ForegroundColor DarkGray
+            }
+        } elseif ($cli -eq "opencode") {
+            $openCodeConfigDir = Get-OpenCodeConfigDir
+            if ($openCodeConfigDir) {
+                $ocSrc     = ConvertTo-WSLPath (Join-Path $openCodeConfigDir "opencode.jsonc")
+                $ocSrcJson = ConvertTo-WSLPath (Join-Path $openCodeConfigDir "opencode.json")
+                $wslConfigPrefix = "mkdir -p ~/.config/opencode && cp -f '$ocSrc' '$ocSrcJson' ~/.config/opencode/ 2>/dev/null; "
+                Write-Host "OpenCode config: copying $openCodeConfigDir/opencode.json(c) into WSL ~/.config/opencode/" -ForegroundColor DarkGray
+            } else {
+                Write-Host "OpenCode config: none found on host — WSL opencode will use its own config." -ForegroundColor DarkGray
             }
         }
 
@@ -2178,7 +2208,7 @@ switch ($mode) {
         $wslPropagatedString = $wslPropagatedParts -join ' '
         $wslEnvString = ("$wslPropagatedString AC_ProjectRoot='$wslProjectRoot' DISABLE_AUTOUPDATER=1 AC_ProjectPath='$wslProjectPath' AC_Worktree='$worktree'").Trim()
 
-        $wslCommandFull = "$wslGoosePrefix" + "cd '$wslWorkDir' && export $wslEnvString && pwsh '$wslScriptPath' $($wslArgs -join ' ')"
+        $wslCommandFull = "$wslConfigPrefix" + "cd '$wslWorkDir' && export $wslEnvString && pwsh '$wslScriptPath' $($wslArgs -join ' ')"
 
         $wslEnvVars = @{
             "AC_ProjectRoot" = $wslProjectRoot
@@ -2453,6 +2483,17 @@ switch ($mode) {
             }
         }
 
+        # OpenCode config mount (only when the opencode agent is selected). OpenCode
+        # reads ~/.config/opencode/opencode.json(c); the host dir maps 1:1 onto the
+        # container path. Read-only — a localhost:1234 LM Studio endpoint in the
+        # config is made reachable by the host-port proxy below.
+        if ($cli -eq "opencode") {
+            $openCodeConfigDir = Get-OpenCodeConfigDir
+            if ($openCodeConfigDir) {
+                $volumeMounts += New-VolumeMount $openCodeConfigDir "/home/claude/.config/opencode" -ReadOnly
+            }
+        }
+
         # Calculate Docker working directory
         $dockerWorkDir     = "$dockerProjectPath$relativePath"
         # All projects now share the AgentCli Docker image — no per-project Dockerfile.
@@ -2581,7 +2622,7 @@ switch ($mode) {
         # (LM Studio must still serve on the network / bind 0.0.0.0, since
         # host.docker.internal maps to a non-loopback host IP.)
         $hostProxyEnvVars = @()
-        if ($cli -eq "goose" -and $currentOS -in "Windows", "macOS") {
+        if ($cli -in "goose", "opencode" -and $currentOS -in "Windows", "macOS") {
             $lmStudioPort = if ($env:AC_LMSTUDIO_PORT) { $env:AC_LMSTUDIO_PORT } else { "1234" }
             $hostProxyEnvVars = @("-e", "AC_HOST_PROXY_PORTS=$lmStudioPort")
         }
